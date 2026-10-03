@@ -1,4 +1,4 @@
-TARGET := iphone:clang:15.0
+TARGET := iphone:clang:15.6
 ARCHS := arm64
 THEOS_PACKAGE_SCHEME = rootless
 TWEAK_NAME = 26AnimSafe
