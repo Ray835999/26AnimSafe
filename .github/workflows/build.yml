@@ -23,7 +23,8 @@ jobs:
 
       - name: Fetch iOS SDK
         run: |
-          curl -sL https://github.com/theos/sdks/raw/master/iPhoneOS15.6.sdk.tar.xz -o /tmp/sdk.tar.xz
+          # theos/sdks ships SDKs as GitHub Release assets, NOT as raw/master files.
+          curl -sL https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS15.6.sdk.tar.xz -o /tmp/sdk.tar.xz
           mkdir -p "$THEOS/sdks"
           tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
 
