@@ -1,0 +1,39 @@
+name: Build 26AnimSafe
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos toolchain dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y perl make git bash clang-15 ldid liblzma-dev libxml2-dev
+          echo "THEOS=${{ github.workspace }}/theos" >> "$GITHUB_ENV"
+
+      - name: Clone Theos
+        run: git clone --recursive https://github.com/theos/theos.git "$THEOS"
+
+      - name: Fetch iOS SDK
+        run: |
+          curl -sL https://github.com/theos/sdks/raw/master/iPhoneOS.sdk.tar.xz -o /tmp/sdk.tar.xz
+          mkdir -p "$THEOS/sdks"
+          tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
+
+      - name: Build (rootless, arm64)
+        run: |
+          export THEOS="$THEOS"
+          make package THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: 26animsafe-deb
+          path: packages/*.deb
