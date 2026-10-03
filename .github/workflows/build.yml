@@ -15,7 +15,7 @@ jobs:
       - name: Install Theos dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y perl make git bash fakeroot dpkg-dev
+          sudo apt-get install -y perl make git bash fakeroot dpkg-dev libxml2
           echo "THEOS=${{ github.workspace }}/theos" >> "$GITHUB_ENV"
 
       - name: Clone Theos
