@@ -28,6 +28,15 @@ jobs:
           mkdir -p "$THEOS/sdks"
           tar -xf /tmp/sdk.tar.xz -C "$THEOS/sdks"
 
+      - name: Fetch iOS toolchain
+        run: |
+          # theos on Linux needs the iOS clang/ldid toolchain (not bundled, not auto-downloaded).
+          # Source: theos bin/install-theos -> L1ghtmann/llvm-project release.
+          # ubuntu-latest (24.04) only ships libtinfo.so.6; the toolchain's clang wants .so.5.
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+          mkdir -p "$THEOS/toolchain"
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz | tar -xJf - -C "$THEOS/toolchain"
+
       - name: Build (rootless, arm64)
         run: make package THEOS_PACKAGE_SCHEME=rootless
 
