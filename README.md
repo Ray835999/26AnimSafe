@@ -1,36 +1,39 @@
 # 26AnimSafe — 不会崩的 iOS 26 开/关 App 缩放动画
 
-## 背景 / 根因
+## 背景 / 根因（已修正）
 
-iPhone 6s (iOS 15.8.8, rootless) 装源 `https://winaviation.github.io/repo/` 里的
-**26Anim** 后，一注销（respring）就进安全模式。把它的 deb 拆开做 Mach-O / ObjC
-元数据分析后确认：
+iPhone 6s (iOS 15.8.8, rootless) 装源 `https://winaviation.github.io/repo/` 的 **26Anim**
+后一注销（respring）就进安全模式。拆包做 Mach-O / ObjC 元数据分析确认：
 
-- 它 **不是** 架构或安装路径装错（deb 装到 `/var/jb/...`，是 rootless 布局，arm64 也对）；
-- 它 hook 的是 **iOS 15 上真实存在的 SpringBoard 图标缩放动画系统**
-  （`SBHomeGesture*Zoom*Settings`、`SBIconZoom*Settings`、私有网格变形
-  `meshTransformWithVertexCount:...`、以及由 `dictionaryWithContentsOfFile:`
-  配置的 `CADisplayLink` 动画循环）；
-- 崩溃是因为它对这条「iOS 26 风格」路径**没有任何存在性 / nil 守卫**，在 15.8.8
-  上某个类/方法缺失或配置文件读出来是 nil，被直接解包 → SpringBoard abort → 安全模式。
-  同作者的 26Home 能在 iOS 15 跑，正好说明「iOS 26 系插件在 iOS 15 必然崩」是错的，
-  只是 26Anim 自己写得不安全。
+- 它 hook 的是 **iOS 26 才有的 SpringBoard 类**（`SBIconZoomAnimator`、
+  `SBHomeGesture*Zoom*Settings` 等）。这些类在 iOS 15.8.8 **根本不存在**；
+- 它对这些类/方法**没有任何存在性 / nil 守卫**，运行时强制解包 nil →
+  SpringBoard abort → 安全模式。
+  （所以「26Anim 在 iOS 15 必然崩」是对的——它依赖的私有类在 iOS 15 上压根没有。）
+
+第一版 26AnimSafe 沿用了同样的 iOS 26 hook 目标、只是加了守卫：结果在 iOS 15 上
+`objc_getClass()` 全部返回 Nil，每个 hook 静默跳过 → **装了但完全没生效、也没崩**
+（正是反馈的「跟原来一样」）。
+
+本版（v1.0.0-2+debug）改 hook **iOS 13–15 真实存在的缩放动画面**（SpringBoardHome.framework
+里的 `SBHIconZoomSettings` 基类和 `SBScaleIconZoomAnimator` / `SBCrossfadeIconZoomAnimator`
+这两个应用开/关缩放动画器），对每个类/方法做存在性守卫 + `@try/@catch` 兜底，保证不崩。
 
 ## 这个修复版的思路
 
-重做一个**源码级、全程守卫**的版本，hook **同一批**图标缩放 Settings 表面，
+重做一个**源码级、全程守卫**的版本，hook **iOS 15 真实存在的**图标缩放 Settings 与动画器，
 复刻 iOS 26 那种「流体缩放」手感，但结构上保证不再让 SpringBoard 崩：
 
-1. 每个目标类 / getter：**不存在就跳过**（类或方法在运行时取不到 → no-op）；
+1. 每个目标类 / getter：**不存在就跳过**（`objc_getClass`/`class_getInstanceMethod` 取不到 → no-op）；
 2. 每次修改都包 `@try/@catch`，失败就回退原始值；
 3. 原始实现永远可调用，作为最后兜底；
 4. 只在 **iOS 13..15** 生效，iOS 16+ 自动让路（原生已经有该动画）。
 
 可见变化来自对缩放 settings 的 `duration` / `cornerRadius` / `scale` 微调
-（用 KVC，属性不存在也不会崩）。原 26Anim 最具辨识度的 3D 网格变形（mesh warp）
-属于「iOS 26 私有原语」，在 iOS 15 上是否可用不确定——本版不强行构造它，
-避免重蹈崩溃覆辙；如果你要 100% 还原那个形变，需要把原 26Anim 的网格数学
-逆向出来再接进来（见下方「进一步」）。
+（用 KVC，属性不存在也不会崩，只会被静默忽略）。默认值：duration 0.55s
+（比系统略慢、更顺滑）、cornerRadius 0、scale 1.0；可在 `com.ngkhoi.26anim.plist`
+里改 `duration`/`corner`/`scale` 后 killall SpringBoard 生效。原 26Anim 最具辨识度的
+3D 网格形变（mesh warp）属于「iOS 26 私有原语」，在 iOS 15 上无法还原——这是平台限制，不是 bug。
 
 ## 复用原设置面板
 
