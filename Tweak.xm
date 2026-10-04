@@ -119,7 +119,10 @@ static void safeSwizzle(const char *clsName, const char *selName) {
 
 // ---------- guarded SCALAR getter swizzle (for duration/scale/cornerRadius) ----------
 // compute(orig) lets each property decide how to combine the system value with ours.
-static void safeSwizzleScalar(const char *clsName, const char *selName, double (*compute)(double)) {
+// Takes a block (not a C function pointer) because Clang won't implicitly convert a
+// block literal to a function pointer.
+typedef double (^ScalarComputeBlock)(double);
+static void safeSwizzleScalar(const char *clsName, const char *selName, ScalarComputeBlock compute) {
     Class cls = objc_getClass(clsName);
     if (cls == Nil) return;
     SEL sel = sel_registerName(selName);

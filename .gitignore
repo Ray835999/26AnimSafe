@@ -1,0 +1,5 @@
+# build artifacts / downloaded debs — not source
+/deploy/
+*.deb
+*.zip
+.theos/
