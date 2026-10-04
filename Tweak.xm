@@ -36,8 +36,6 @@ static double gDuration = 0.55;   // zoom duration (s); <=0 keeps system value
 static double gCorner   = 0.0;    // corner radius applied during zoom (pt); 0 = native
 static double gScale    = 1.0;    // extra scale multiplier (1.0 = native)
 
-static NSMutableDictionary<NSString *, NSValue *> *gOrig = nil;
-
 // ---------- preferences ----------
 static void loadPrefs(void) {
     @try {
@@ -96,7 +94,7 @@ static id modifySettings(id self, SEL _cmd, IMP origImp) {
         }
         return orig;
     } @catch (...) {
-        return origf(self, _cmd);
+        return nil;   // never re-invoke the original from inside the catch
     }
 }
 
@@ -108,11 +106,12 @@ static void safeSwizzle(const char *clsName, const char *selName) {
     Method m = class_getInstanceMethod(cls, sel);
     if (m == NULL) return;                        // getter absent -> skip
     IMP orig = method_getImplementation(m);
-    NSString *key = [NSString stringWithUTF8String:selName];
-    gOrig[key] = [NSValue valueWithPointer:(void *)orig];
+    // Capture the original IMP directly (per class+sel) inside the block. NEVER key it
+    // through a shared dictionary by selector name alone: several animator classes share
+    // the same selector (e.g. every *IconZoomAnimator has -settings), and cross-wiring
+    // their originals made SpringBoard call the wrong class's IMP -> crash loop.
     IMP repl = imp_implementationWithBlock(^id(id s, SEL c) {
-        IMP o = (IMP)[gOrig[key] pointerValue];
-        return modifySettings(s, c, o);
+        return modifySettings(s, c, orig);
     });
     method_setImplementation(m, repl);
 }
@@ -129,8 +128,7 @@ static void safeSwizzleScalar(const char *clsName, const char *selName, ScalarCo
     Method m = class_getInstanceMethod(cls, sel);
     if (m == NULL) return;
     double (*origf)(id, SEL) = (double (*)(id, SEL))method_getImplementation(m);
-    NSString *key = [NSString stringWithUTF8String:selName];
-    gOrig[key] = [NSValue valueWithPointer:(void *)origf];
+    // origf is captured directly by the block below (no shared dictionary needed).
     IMP repl = imp_implementationWithBlock(^double(id s, SEL c) {
         double o = origf(s, c);
         if (!gEnabled) return o;
@@ -141,7 +139,6 @@ static void safeSwizzleScalar(const char *clsName, const char *selName, ScalarCo
 
 %ctor {
     @autoreleasepool {
-        gOrig = [NSMutableDictionary new];
         loadPrefs();
 
         // Live reload when the user toggles in Settings (the pane posts this Darwin note).
