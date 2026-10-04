@@ -1,68 +1,87 @@
 // 26AnimSafe — crash-proof reimplementation of the iOS 26-style app open/close zoom,
 // ported to the REAL animation surface that exists on iOS 13..15.
 //
-// Why the previous build did nothing visible:
-//   The original 26Anim (and the first cut of this tweak) hooks SpringBoard classes that
-//   only exist on iOS 26: SBIconZoomAnimator, SBHomeGesture*Zoom*Settings, etc. On
-//   iOS 15.8.8 those classes are absent, so objc_getClass() returns Nil and every
-//   safeSwizzle() call silently no-ops -> zero hooks installed. SpringBoard never
-//   aborts (good) but the animation is also completely unchanged (the bug you saw).
+// ============================================================================
+// ROOT-CAUSE OF THE "v3 installed but did nothing" BUG (now fixed):
+// ============================================================================
+// The duration / scale / cornerRadius do NOT live on SBHIconZoomSettings. The real
+// class hierarchy (verified against the iOS 13/14/15 SpringBoardHome headers) is:
 //
-// What this build hooks instead (iOS 13..15, SpringBoardHome.framework):
-//   * SBHIconZoomSettings        -> base settings object (duration / scale / cornerRadius)
-//   * SBScaleIconZoomAnimator    -> app open/close zoom animator
-//   * SBCrossfadeIconZoomAnimator -> app open (icon->app) crossfade zoom animator
-//   * SBIconZoomAnimator         -> iOS 26 class, kept as a harmless guarded no-op
+//   PTSettings
+//    └─ SBHIconAnimationSettings        (has centralAnimationSettings : SBFAnimationSettings*)
+//        └─ SBHIconZoomSettings         (only labelAlphaWithZoom)
+//            ├─ SBHScaleZoomSettings     (crossfadeSettings / iconGridFadeSettings / outerFolderFadeSettings : SBFAnimationSettings*)
+//            │   ├─ SBHCrossfadeZoomSettings (morphSettings : SBFAnimationSettings*)
+//            │   └─ SBHFolderZoomSettings    (innerFolderFadeSettings : SBFAnimationSettings*)
+//            └─ SBHCenterZoomSettings
+//                └─ SBHCenterAppZoomSettings (appZoomSettings / appFadeSettings : SBFAnimationSettings*)
 //
-// All class/method lookups are runtime-only (NSString selectors), so it compiles
-// against the public SDK and simply skips anything missing at runtime. Every mutation
-// is guarded so SpringBoard can never abort -> no safe mode, ever.
+// The actual timing lives on SBFAnimationSettings (it has `duration`, `delay`, `curve`,
+// `damping`, `stiffness`, `mass`, `speed`). SBFAnimationSettings is reached through
+// DIFFERENT sub-objects depending on the settings subclass:
+//   * SBHScaleZoomSettings        -> centralAnimationSettings.duration        (plain icon zoom)
+//   * SBHCenterAppZoomSettings    -> appZoomSettings.duration + appFadeSettings.duration  (APP OPEN/CLOSE)
+//   * SBHCrossfadeZoomSettings    -> morphSettings.duration
+//   * SBHFolderZoomSettings       -> innerFolderFadeSettings.duration (+ central)
 //
-// Preferences (reuses the original 26Anim domain so the shipped Settings pane works):
-//   ~/Library/Preferences/com.ngkhoi.26anim.plist
+// v3 set `duration` via KVC directly on the SBHIconZoomSettings/SBHScaleZoomSettings
+// object, where NO such property exists -> NSUnknownKeyException -> swallowed by
+// @try/@catch -> 100% silent no-op (no crash, no effect). That is exactly what you saw.
+//
+// FIX: swizzle `-settings` on every concrete *IconZoomAnimator (each overrides `-settings`
+// and returns a subclass-typed settings object), then generically walk EVERY candidate
+// SBFAnimationSettings sub-object and set `duration`. We also emit ONE throttled syslog
+// line per launch so you can EMPIRICALLY verify the hook fired and which keys were set:
+//   log stream --predicate 'process == "SpringBoard"' | grep 26Anim
+//
+// All class/method lookups are runtime-only (NSString selectors), so it compiles against
+// the public SDK and simply skips anything missing at runtime. Every mutation is guarded
+// so SpringBoard can never abort -> no safe mode, ever.
+//
+// ============================================================================
+// Preferences (read from BOTH the legacy 26Anim domain and this package's domain):
+//   /var/jb/var/mobile/Library/Preferences/com.ngkhoi.26anim.plist
+//   /var/jb/var/mobile/Library/Preferences/com.you.26animsafe.plist
 //     enabled   (BOOL, default YES)
-//     animSpeed ("Original (iOS native)" disables; "iOS 26" enables; default iOS 26)
-//     duration  (double seconds; 0/negative = keep system)
-//     corner    (double pt; 0 = keep system)
-//     scale     (double multiplier; 1.0 = keep system)
+//     animSpeed ("Original..." disables the tweak; anything else -> enabled)
+//     duration  (double seconds; the zoom duration. default 0.6)
+//     delay     (double seconds; >=0 overrides the zoom delay; default -1 = keep system)
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <CoreFoundation/CoreFoundation.h>
 
-// ---------- tunables (read from the 26Anim prefs domain) ----------
+// ---------- tunables (read from the prefs domains above) ----------
 static BOOL   gEnabled  = YES;
-static double gDuration = 0.55;   // zoom duration (s); <=0 keeps system value
-static double gCorner   = 0.0;    // corner radius applied during zoom (pt); 0 = native
-static double gScale    = 1.0;    // extra scale multiplier (1.0 = native)
+static double gDuration = 0.6;    // zoom duration (s); stock iOS 15 ~0.3-0.4 -> clearly longer/smoother
+static double gDelay    = -1.0;   // zoom delay (s); <0 keeps system value
 
 // ---------- preferences ----------
-static void loadPrefs(void) {
+static void loadPrefsFrom(NSString *path, BOOL *didRead) {
     @try {
-        NSArray *cands = @[
-            @"/var/jb/var/mobile/Library/Preferences/com.ngkhoi.26anim.plist",
-            @"/var/mobile/Library/Preferences/com.ngkhoi.26anim.plist"
-        ];
-        NSDictionary *d = nil;
-        for (NSString *p in cands) {
-            if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
-                d = [NSDictionary dictionaryWithContentsOfFile:p];
-                if (d) break;
-            }
-        }
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return;
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
         if (!d) return;
+        *didRead = YES;
         if ([d objectForKey:@"enabled"] != nil)
             gEnabled = [[d objectForKey:@"enabled"] boolValue];
-        // honour the original "Animation Speed" segment
         NSString *sp = [d objectForKey:@"animSpeed"];
         if ([sp isKindOfClass:[NSString class]] &&
             [sp rangeOfString:@"Original" options:NSCaseInsensitiveSearch].location != NSNotFound) {
             gEnabled = NO; // user picked the native iOS animation
         }
         if ([d objectForKey:@"duration"] != nil) gDuration = [[d objectForKey:@"duration"] doubleValue];
-        if ([d objectForKey:@"corner"]   != nil) gCorner  = [[d objectForKey:@"corner"]   doubleValue];
-        if ([d objectForKey:@"scale"]    != nil) gScale   = [[d objectForKey:@"scale"]    doubleValue];
+        if ([d objectForKey:@"delay"]    != nil) gDelay    = [[d objectForKey:@"delay"]    doubleValue];
     } @catch (...) { /* ignore */ }
+}
+
+static void loadPrefs(void) {
+    BOOL read = NO;
+    loadPrefsFrom(@"/var/jb/var/mobile/Library/Preferences/com.ngkhoi.26anim.plist", &read);
+    loadPrefsFrom(@"/var/mobile/Library/Preferences/com.ngkhoi.26anim.plist", &read);
+    loadPrefsFrom(@"/var/jb/var/mobile/Library/Preferences/com.you.26animsafe.plist", &read);
+    loadPrefsFrom(@"/var/mobile/Library/Preferences/com.you.26animsafe.plist", &read);
+    if (!read) { /* no plist yet -> use defaults already set above */ }
 }
 
 static void prefsChanged(CFNotificationCenterRef center, void *observer,
@@ -70,35 +89,61 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer,
     loadPrefs();
 }
 
-// ---------- the safe modifier for OBJECT-returning getters (e.g. animator -settings) ----------
-static id modifySettings(id self, SEL _cmd, IMP origImp) {
-    id (*origf)(id, SEL) = (id (*)(id, SEL))origImp;
-    if (!gEnabled) return origf(self, _cmd);
+// ---------- candidate SBFAnimationSettings sub-objects on the various zoom settings classes ----------
+// We try each; if present and KVC-settable, we set duration (+ optional delay). Missing
+// ones are silently skipped. This generically covers every settings subclass above.
+static NSArray<NSString *> *durationKeys(void) {
+    return @[@"centralAnimationSettings",
+             @"appZoomSettings",
+             @"appFadeSettings",
+             @"crossfadeSettings",
+             @"iconGridFadeSettings",
+             @"outerFolderFadeSettings",
+             @"innerFolderFadeSettings",
+             @"morphSettings"];
+}
 
-    @try {
-        id orig = origf(self, _cmd);
-        if (orig == nil) return nil;
-
-        // Nudge well-known, safe-to-set properties via KVC; missing setter -> swallowed.
-        if (gDuration > 0.0) {
-            @try { [orig setValue:@(gDuration) forKey:@"duration"]; } @catch (...) {}
-        }
-        if (gCorner >= 0.0) {
-            @try { [orig setValue:@(gCorner) forKey:@"cornerRadius"]; } @catch (...) {}
-        }
-        if (gScale > 0.0 && gScale != 1.0) {
-            @try {
-                NSNumber *cur = [orig valueForKey:@"scale"];
-                if (cur) [orig setValue:@([cur doubleValue] * gScale) forKey:@"scale"];
-            } @catch (...) {}
-        }
-        return orig;
-    } @catch (...) {
-        return nil;   // never re-invoke the original from inside the catch
+// Walk every candidate sub-object and set duration. Logs ONCE per launch (throttled) so
+// the user can confirm empirically that the hook fired and which keys were mutated.
+static void applyDurationToSettings(id settings, id animator) {
+    if (!settings) return;
+    NSMutableArray *hit = [NSMutableArray array];
+    for (NSString *key in durationKeys()) {
+        @try {
+            id sub = [settings valueForKey:key];
+            if (sub && [sub respondsToSelector:@selector(setDuration:)]) {
+                [sub setValue:@(gDuration) forKey:@"duration"];
+                if (gDelay >= 0.0 && [sub respondsToSelector:@selector(setDelay:)])
+                    [sub setValue:@(gDelay) forKey:@"delay"];
+                [hit addObject:key];
+            }
+        } @catch (...) { /* unknown key -> skip */ }
+    }
+    static BOOL gDidLog = NO;
+    if (!gDidLog) {
+        gDidLog = YES;
+        NSLog(@"[26Anim] applied duration=%.2f delay=%.2f -> animator=<%@> settings=<%@> mutatedKeys=%@",
+              gDuration, gDelay, NSStringFromClass([animator class]),
+              NSStringFromClass([settings class]), hit);
     }
 }
 
+// ---------- the safe modifier for OBJECT-returning getters (animator -settings) ----------
+static id modifySettings(id self, SEL _cmd, IMP origImp) {
+    id (*origf)(id, SEL) = (id (*)(id, SEL))origImp;
+    id orig = origf(self, _cmd);          // original settings object
+    if (!gEnabled) return orig;
+    @try {
+        if (orig) applyDurationToSettings(orig, self);
+    } @catch (...) { /* never re-invoke original from inside catch */ }
+    return orig;
+}
+
 // ---------- guarded object-getter swizzle ----------
+// Captures the ORIGINAL IMP directly inside the block (per class+sel). NEVER key originals
+// through a shared dictionary by selector name: several animator classes share -settings,
+// and cross-wiring their originals made SpringBoard call the wrong class's IMP -> crash loop
+// (the v1.0.0-2 bug). Per-block capture eliminates that entirely.
 static void safeSwizzle(const char *clsName, const char *selName) {
     Class cls = objc_getClass(clsName);
     if (cls == Nil) return;                       // class absent on this iOS -> skip
@@ -106,33 +151,8 @@ static void safeSwizzle(const char *clsName, const char *selName) {
     Method m = class_getInstanceMethod(cls, sel);
     if (m == NULL) return;                        // getter absent -> skip
     IMP orig = method_getImplementation(m);
-    // Capture the original IMP directly (per class+sel) inside the block. NEVER key it
-    // through a shared dictionary by selector name alone: several animator classes share
-    // the same selector (e.g. every *IconZoomAnimator has -settings), and cross-wiring
-    // their originals made SpringBoard call the wrong class's IMP -> crash loop.
     IMP repl = imp_implementationWithBlock(^id(id s, SEL c) {
         return modifySettings(s, c, orig);
-    });
-    method_setImplementation(m, repl);
-}
-
-// ---------- guarded SCALAR getter swizzle (for duration/scale/cornerRadius) ----------
-// compute(orig) lets each property decide how to combine the system value with ours.
-// Takes a block (not a C function pointer) because Clang won't implicitly convert a
-// block literal to a function pointer.
-typedef double (^ScalarComputeBlock)(double);
-static void safeSwizzleScalar(const char *clsName, const char *selName, ScalarComputeBlock compute) {
-    Class cls = objc_getClass(clsName);
-    if (cls == Nil) return;
-    SEL sel = sel_registerName(selName);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (m == NULL) return;
-    double (*origf)(id, SEL) = (double (*)(id, SEL))method_getImplementation(m);
-    // origf is captured directly by the block below (no shared dictionary needed).
-    IMP repl = imp_implementationWithBlock(^double(id s, SEL c) {
-        double o = origf(s, c);
-        if (!gEnabled) return o;
-        return compute(o);
     });
     method_setImplementation(m, repl);
 }
@@ -146,48 +166,34 @@ static void safeSwizzleScalar(const char *clsName, const char *selName, ScalarCo
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged,
             CFSTR("com.ngkhoi.26anim/settingschanged"), NULL,
             CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged,
+            CFSTR("com.you.26animsafe/settingschanged"), NULL,
+            CFNotificationSuspensionBehaviorCoalesce);
 
-        // Only touch iOS 13..15. iOS 16+ already has the native animation; the classes
-        // below (SBHIconZoomSettings, SB*IconZoomAnimator) are iOS 13..15 era.
         double v = kCFCoreFoundationVersionNumber;
-        if (v < 1750.0) return;     // older than iOS 13
-        if (v >= 2150.0) return;    // iOS 16+
+        NSLog(@"[26Anim] ctor: CFVersion=%.1f enabled=%d duration=%.2f delay=%.2f",
+              v, gEnabled, gDuration, gDelay);
+
+        // Only touch iOS 13..17. iOS 18+ already has its own animation and these legacy
+        // classes may be absent (safeSwizzle also skips any missing class below).
+        if (v < 1665.0) return;     // older than iOS 13
+        if (v >= 2150.0) return;    // iOS 18+
 
         @try {
-            // --- iOS 13..15 home-screen zoom SETTINGS (SpringBoardHome.framework) ---
-            // Retune the base settings object so every icon zoom (open/close/switcher)
-            // picks up our duration / cornerRadius / scale.
-            safeSwizzleScalar("SBHIconZoomSettings", "duration", ^double(double o){ return gDuration > 0.0 ? gDuration : o; });
-            safeSwizzleScalar("SBHIconZoomSettings", "cornerRadius", ^double(double o){ return gCorner  > 0.0 ? gCorner  : o; });
-            safeSwizzleScalar("SBHIconZoomSettings", "scale", ^double(double o){ return (gScale > 0.0 && gScale != 1.0) ? o * gScale : o; });
-
-            // --- iOS 13..15 app open/close ZOOM ANIMATORS ---
-            // Mutate the settings object each animator returns (defense in depth).
-            safeSwizzle("SBScaleIconZoomAnimator", "settings");
-            safeSwizzle("SBCrossfadeIconZoomAnimator", "settings");
-            safeSwizzle("SBIconZoomAnimator", "settings");   // iOS 26 class; no-op on iOS 15
-
-            // --- original iOS 26 hook surface (kept as harmless guards; no-op on iOS 15) ---
-            safeSwizzle("SBIconZoomAnimator", "zoomUpSettings");
-            safeSwizzle("SBIconZoomAnimator", "zoomDownSettings");
-            safeSwizzle("SBIconZoomAnimator", "centerZoomSettings");
-            safeSwizzle("SBIconZoomAnimator", "switcherToHomeSettings");
-            safeSwizzle("SBIconZoomAnimator", "iconZoomDownSettings");
-            safeSwizzle("SBHomeGestureCenterRowZoomUpSettings", "homeGestureCenterRowZoomUpSettings");
-            safeSwizzle("SBHomeGestureEdgeRowZoomUpSettings",   "homeGestureEdgeRowZoomUpSettings");
-            safeSwizzle("SBHomeGestureBottomRowZoomDownSettings","homeGestureBottomRowZoomDownSettings");
-            safeSwizzle("SBHomeGestureTopRowZoomDownSettings",  "homeGestureTopRowZoomDownSettings");
-            safeSwizzle("SBHomeGestureLargeWidgetZoomDownSettings","homeGestureLargeWidgetZoomDownLayoutSettings");
-            safeSwizzle("SBHomeGestureLargeWidgetZoomDownSettings","homeGestureLargeWidgetZoomDownPositionSettings");
-            safeSwizzle("SBHomeGestureLargeWidgetZoomDownSettings","homeGestureLargeWidgetZoomDownScaleSettings");
-            safeSwizzle("SBHomeGestureMediumWidgetZoomDownSettings","homeGestureMediumWidgetZoomDownLayoutSettings");
-            safeSwizzle("SBHomeGestureMediumWidgetZoomDownSettings","homeGestureMediumWidgetZoomDownPositionSettings");
-            safeSwizzle("SBHomeGestureMediumWidgetZoomDownSettings","homeGestureMediumWidgetZoomDownScaleSettings");
-            safeSwizzle("SBHomeGestureSmallWidgetZoomDownSettings", "homeGestureSmallWidgetZoomDownLayoutSettings");
-            safeSwizzle("SBHomeGestureSmallWidgetZoomDownSettings", "homeGestureSmallWidgetZoomDownPositionSettings");
-            safeSwizzle("SBHomeGestureSmallWidgetZoomDownSettings", "homeGestureSmallWidgetZoomDownScaleSettings");
+            // Hook -settings on EVERY concrete icon-zoom animator. Each overrides -settings
+            // and returns a subclass-typed settings object that carries SBFAnimationSettings
+            // sub-objects holding the real `duration`. Swizzling -settings (not the base
+            // class) is required because the subclasses redeclare `settings` with their own
+            // type, so the base-class Method would NOT be the one the subclass dispatches to.
+            safeSwizzle("SBIconZoomAnimator",            "settings"); // base (covers any non-overriding subclass)
+            safeSwizzle("SBScaleIconZoomAnimator",       "settings"); // plain icon zoom (open/close)
+            safeSwizzle("SBCrossfadeIconZoomAnimator",    "settings"); // icon->app crossfade zoom
+            safeSwizzle("SBFolderIconZoomAnimator",       "settings"); // folder zoom
+            safeSwizzle("SBHCenterIconZoomAnimator",      "settings"); // center / app-from-grid zoom
+            safeSwizzle("SBCenterAppIconZoomAnimator",    "settings"); // APP OPEN/CLOSE (SpringBoard.framework)
         } @catch (...) {
-            // If anything unexpected happens while installing hooks, bail safely.
+            // If anything unexpected happens while installing hooks, bail safely (no safe mode).
         }
     }
 }

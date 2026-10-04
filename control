@@ -1,8 +1,8 @@
 Package: com.you.26animsafe
 Name: 26AnimSafe (Fluid Open/Close)
-Version: 1.0.0-3
+Version: 1.0.0-4
 Architecture: iphoneos-arm64
-Description: Crash-proof reimplementation of the iOS 26 app open/close zoom for iOS 13-15 (rootless). Mirrors 26Anim's hook surface but guards every call so SpringBoard never aborts.
+Description: iOS 26-style app open/close zoom for iOS 13-15 (rootless). Hooks each *IconZoomAnimator -settings and retunes the real SBFAnimationSettings.duration (centralAnimationSettings/appZoomSettings/appFadeSettings/...). Crash-proof: every call guarded, per-class IMP capture.
 Depends: mobilesubstrate
 Maintainer: you <you@example.com>
 Author: you
