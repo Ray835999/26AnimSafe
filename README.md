@@ -34,25 +34,44 @@ v1.0.0-2 因为把 `-settings` 在两个都叫 `-settings` 的动画器类上**�
 `setValue:forKey:@"duration"` → 触发 `NSUnknownKeyException` → 被 `@try/@catch` 吞掉 → **100% 静默 no-op**
 （不崩、但毫无效果，正是你看到的「跟原来一样」）。
 
-## v1.0.0-4 的修复思路
+## v1.0.0-5 —— 真正生效的修法（关键）
 
-1. 对 **每个具体 `*IconZoomAnimator`**（`SBScaleIconZoomAnimator`、`SBCrossfadeIconZoomAnimator`、
-   `SBFolderIconZoomAnimator`、`SBHCenterIconZoomAnimator`、`SBCenterAppIconZoomAnimator`、
-   `SBIconZoomAnimator`）swizzle 它的 `-settings` getter。这些子类都重写了 `-settings` 并返回各自类型的
-   settings 子类，所以必须**逐个 hook 子类**，不能只 hook 基类（基类 Method 不是子类实际派发的那个）；
-2. 在 `-settings` 返回的对象上**通用地**遍历所有候选 `SBFAnimationSettings` 子对象
-   （`centralAnimationSettings` / `appZoomSettings` / `appFadeSettings` / `crossfadeSettings` /
-   `iconGridFadeSettings` / `outerFolderFadeSettings` / `innerFolderFadeSettings` / `morphSettings`），
-   用 KVC 把 `duration` 设成目标值（可选 `delay`）。缺哪个就跳过，不影响其余；
-3. 每个目标类/方法**不存在就跳过**，每次修改包 `@try/@catch`，原始 IMP **各自捕获、绝不交叉串台** → 不崩；
-4. 只在 **iOS 13..17** 生效，iOS 18+ 自动让路；
-5. **加了一次性 syslog 日志**（`[26Anim]`）：装好 respring 后抓
-   `log stream --predicate 'process == "SpringBoard"' | grep 26Anim` 即可**实证**本 tweak 是否真的
-   命中了动画、改了哪些 key（满足「no error ≠ verified」的硬要求）。
+v1.0.0-4 仍然「装了没反应」，根因是 **hook 错了类树**：
 
-可见变化来自把 `SBFAnimationSettings.duration` 调长（KVC，属性不存在会被吞掉但其余照常）。
-默认 **duration = 0.6s**（系统约 0.3–0.4s，明显更慢更顺滑）。原 26Anim 的 3D 网格形变属于 iOS 26
-私有原语，iOS 15 上无法还原——平台限制，不是 bug。
+- iOS 15 上 App 开/关（打断）缩放**根本不是**由 `SBHIconZoomSettings` /
+  `SBFAnimationSettings.duration` 驱动的；
+- 它由一个 **fluid behavior**（类似 `UISpringTimingParameters`）驱动，对应类叫
+  **`SBFFluidBehaviorSettings`**（SpringBoardFoundation），暴露两个 setter：
+  - `-setResponse:` —— 时间常数（秒），**越大越慢**；系统 App 缩放约 `0.37`，iOS 26 明显更慢；
+  - `-setDampingRatio:` —— `1.0` = 临界阻尼（无回弹），**越小回弹/过冲越多**。
+- v3/v4 去改 `SBHIconZoomSettings` / `SBFAnimationSettings.duration` 这个**完全不参与 App
+  开/关缩放**的树，所以 100% 静默 no-op（不崩、也没效）。
+
+**v5 改为 hook `SBFFluidBehaviorSettings`**（这正是开源 tweak Speedster 在 iOS 13–16.7 上
+用来做「App 开/关速度 + 回弹」的同一套、跨版本稳定的底层机制），强制：
+
+- `response` 调大 → 缩放明显变慢、更绵长（iOS 26 感）；
+- `dampingRatio` 略低于 1.0 → 轻微过冲/回弹。
+
+这是版本无关、必有可见效果的写法（只要 `SBFFluidBehaviorSettings` 存在于该 iOS，而它在
+iOS 13–16 全部存在）。
+
+### v5 的具体做法
+
+1. `%hook SBFFluidBehaviorSettings`：重写 `-setResponse:` / `-setDampingRatio:`，开启时强制
+   为目标值（`response=0.50`、`dampingRatio=0.72`）；关闭时 `%orig` 原值；
+2. `%hook SBFAnimationSettings`：把**短**（≤0.5s）的 `duration` 也拉到 `0.45s`
+   （文件夹缩放、图标标签淡入等），让整个「缩放家族」观感一致；长过渡不动，避免全局拖慢；
+3. 全部是 Logos `%hook`（每个类各自捕获原始 IMP，**结构上不可能交叉串台 / 不可能让 SpringBoard
+   abort**），且受 `gEnabled` 守卫；iOS 18+ 自动让路；
+4. **一次性 syslog 日志**（`[26Anim]`）：respring 后打开一次 App 即可在日志里看到
+   `SBFFluidBehaviorSettings.setResponse forced 0.500 ...`，**实证** hook 命中且值已写入。
+
+> 真·iOS 26「手势跟手连续打断」需要 `UIViewAnimating` 交互式架构，iOS 15 没有这层机制，
+> 无法 1:1 还原。v5 做到的是「慢 + 弹性回弹」的近似观感——这是 iOS 15 上能达到的最接近效果。
+
+默认 **response = 0.50s / dampingRatio = 0.72 / duration = 0.45s**（系统开/关约 0.37s，明显更慢更顺滑）。
+原 26Anim 的 3D 网格形变属于 iOS 26 私有原语，iOS 15 上无法还原——平台限制，不是 bug。
 
 ## 复用原设置面板
 
@@ -70,12 +89,15 @@ v1.0.0-2 因为把 `-settings` 在两个都叫 `-settings` 的动画器类上**�
    （在 Actions 页面的 Artifacts 里下载）；
 3. 用 Sileo / Filza 安装 `26animsafe-deb`；
 4. 重启 SpringBoard（respring）。它**不会**再进安全模式。
-5. 想要更快/更慢的缩放，改时长（秒）后 respring 生效：
+5. 想要更快/更慢、更弹/更稳的缩放，改下列键后 respring 生效：
    - `/var/jb/var/mobile/Library/Preferences/com.ngkhoi.26anim.plist`（设置面板实际写入的域）
    - 或 `/var/jb/var/mobile/Library/Preferences/com.you.26animsafe.plist`
-   加 `duration`(double，秒；默认 0.6) 和可选 `delay`(double，秒；-1=跟随系统)。
-   例：`{ enabled = 1; duration = 0.8; }`（0.8s 更接近 iOS 26 的绵长缩放）。
-   `corner` / `scale` 在这个动画面上**不可控**（缩放比例由动画器内部算，不在 settings 里），忽略即可。
+   键（均为 double 秒 / 无量纲）：
+     - `response` —— 越大越慢（默认 0.50；想更接近 iOS 26 绵长缩放可设 0.6）
+     - `dampingRatio` —— 越小回弹越多（默认 0.72；0.6 更弹、0.9 几乎不弹）
+     - `duration` —— 短过渡（文件夹缩放等）时长（默认 0.45）
+   例：`{ enabled = 1; response = 0.6; dampingRatio = 0.65; }`。
+   设置面板里的 **Animation Speed = Original (iOS native)** 或本包 **Enable Animations** 关掉即还原。
 
 > 你已有的 GitHub Actions 越狱工具链可以直接套用 `.github/workflows/build.yml`，
 > 或把本目录并进去你现有的 theos 工程。
@@ -88,9 +110,11 @@ v1.0.0-2 因为把 `-settings` 在两个都叫 `-settings` 的动画器类上**�
   `log stream --predicate 'process == "SpringBoard"' | grep 26Anim`
   （或装 `idevicesyslog` / syslog 类插件在手机上抓），respring 后**打开一次 App**，
   应能看到一行类似
-  `[26Anim] applied duration=0.60 delay=-1.00 -> animator=<SBCenterAppIconZoomAnimator> settings=<SBHCenterAppZoomSettings> mutatedKeys=(centralAnimationSettings,appZoomSettings,appFadeSettings)`。
-  看到这行 = hook 命中且 `duration` 已写入，动画必然变慢；**看不到** = 这个 iOS 版本的动画器类
-  名又不一样，把那行 syslog 贴给我，我再加对应类。
+  `[26Anim] SBFFluidBehaviorSettings.setResponse forced 0.500 (was 0.370)`
+  和 / 或
+  `[26Anim] SBFFluidBehaviorSettings.setDampingRatio forced 0.720 (was 1.000)`。
+  看到这行 = **hook 命中且值已写入**，App 开/关缩放必然变慢 + 带轻微回弹；**看不到** =
+  你这台 iOS 的 `SBFFluidBehaviorSettings` 行为异常，把那行 syslog 贴给我即可。
 - 万一出现意外：设置 → 26Anim 里把 **Enable Animations** 关掉，或进安全模式卸载即可。
 
 ## 进一步（可选）
