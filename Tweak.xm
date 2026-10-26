@@ -46,8 +46,8 @@
 
 // ---------- tunables ----------
 static BOOL   gEnabled      = YES;
-static double gResponse     = 0.50;   // larger = slower/open (iOS 26 feel). stock ~0.37
-static double gDampingRatio = 0.72;   // lower = more bounce. stock ~1.0 (none)
+static double gResponse     = 0.45;   // larger = slower/open (iOS 26 feel). stock ~0.37
+static double gDampingRatio = 1.0;    // 1.0 = critically damped (NO overshoot/bounce). stock ~1.0
 static double gDuration     = 0.45;   // short-transition duration cap (folder zoom etc.)
 
 // ---------- throttled log flags ----------
