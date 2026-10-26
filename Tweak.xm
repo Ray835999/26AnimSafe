@@ -50,6 +50,16 @@ static double gResponse     = 0.45;   // larger = slower/open (iOS 26 feel). sto
 static double gDampingRatio = 1.0;    // 1.0 = critically damped (NO overshoot/bounce). stock ~1.0
 static double gDuration     = 0.45;   // short-transition duration cap (folder zoom etc.)
 
+// ---------- experimental skew (iOS 26-style perspective tilt) ----------
+// EXPERIMENTAL. Off by default (gSkewEnabled = NO). When enabled we hook
+// SBFullscreenZoomView -setTransform: and, while the app-open zoom is mid-flight
+// (scale < 1.0), re-apply the transform with a perspective (m34) plus a decaying
+// rotateY so the icon appears to swing in on a 3D plane. Angle fades to 0 as the
+// view reaches fullscreen, so there is no lingering tilt. If your device's
+// app-open path does NOT use SBFullscreenZoomView, this is a safe no-op.
+static BOOL   gSkewEnabled  = NO;     // default OFF — set true in plist to try
+static double gSkewAngle    = 8.0;    // peak tilt in degrees at the start of the zoom
+
 // ---------- throttled log flags ----------
 static BOOL gLoggedResp = NO;
 static BOOL gLoggedDamp = NO;
@@ -71,6 +81,8 @@ static void loadPrefsFrom(NSString *path) {
         if ([d objectForKey:@"response"]     != nil) gResponse     = [[d objectForKey:@"response"]     doubleValue];
         if ([d objectForKey:@"dampingRatio"] != nil) gDampingRatio = [[d objectForKey:@"dampingRatio"] doubleValue];
         if ([d objectForKey:@"duration"]     != nil) gDuration     = [[d objectForKey:@"duration"]     doubleValue];
+        if ([d objectForKey:@"skewEnabled"]  != nil) gSkewEnabled  = [[d objectForKey:@"skewEnabled"]  boolValue];
+        if ([d objectForKey:@"skewAngle"]    != nil) gSkewAngle    = [[d objectForKey:@"skewAngle"]    doubleValue];
     } @catch (...) { /* ignore corrupt plist */ }
 }
 
@@ -119,6 +131,43 @@ static void swizzleDoubleSetter(const char *clsName, const char *selName,
     NSLog(@"[26Anim] swizzled %s %s -> force %.3f", clsName, selName, val);
 }
 
+// ---------- experimental skew swizzle ----------
+// Hooks SBFullscreenZoomView -setTransform: (the UIView setter SpringBoard drives
+// during the app-open zoom). We let UIView apply the transform normally, then
+// overwrite the layer transform with perspective + a decaying rotateY. Guarded:
+// if the class or selector is absent, nothing happens. Pure no-op when
+// gSkewEnabled = NO, so it can never by itself cause a safe mode.
+static void swizzleSkew(void) {
+    Class cls = objc_getClass("SBFullscreenZoomView");
+    if (cls == Nil) {
+        NSLog(@"[26Anim] skew: SBFullscreenZoomView not found, skip");
+        return;
+    }
+    SEL sel = sel_registerName("setTransform:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m == NULL) {
+        NSLog(@"[26Anim] skew: setTransform: not found, skip");
+        return;
+    }
+    IMP orig = method_getImplementation(m);
+    IMP repl = imp_implementationWithBlock(^void(id s, SEL c, CGAffineTransform t) {
+        typedef void (*SetT)(id, SEL, CGAffineTransform);
+        SetT o = (SetT)orig;
+        o(s, c, t);                       // let UIView do its normal work
+        if (!gSkewEnabled) return;
+        CGFloat sc = (t.a < 0 ? -t.a : t.a);
+        if (sc <= 0.001f || sc >= 1.0f) return;   // only affect mid-flight zoom
+        CGFloat ang = gSkewAngle * (1.0f - sc) * (3.141592653589793f / 180.0f);
+        CATransform3D base = CATransform3DMakeAffineTransform(t);
+        CATransform3D p    = CATransform3DIdentity;
+        p.m34 = -1.0f / 700.0f;           // perspective (near-bigger)
+        CATransform3D r    = CATransform3DRotate(p, ang, 0.0f, 1.0f, 0.0f);
+        ((UIView *)s).layer.transform = CATransform3DMultiply(r, base);
+    });
+    method_setImplementation(m, repl);
+    NSLog(@"[26Anim] skew: swizzled SBFullscreenZoomView setTransform:");
+}
+
 %ctor {
     @autoreleasepool {
         loadPrefs();
@@ -150,5 +199,8 @@ static void swizzleDoubleSetter(const char *clsName, const char *selName,
         // BONUS: slow short SBFAnimationSettings transitions (folder zoom, label fade...).
         swizzleDoubleSetter("SBFAnimationSettings", "setDuration:",
                              &gDuration, &gLoggedDur, "SBFAnimationSettings.setDuration");
+
+        // EXPERIMENTAL: optional iOS 26-style perspective tilt on app open.
+        swizzleSkew();
     }
 }
