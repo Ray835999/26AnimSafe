@@ -162,7 +162,7 @@ static void swizzleSkew(void) {
         CATransform3D p    = CATransform3DIdentity;
         p.m34 = -1.0f / 700.0f;           // perspective (near-bigger)
         CATransform3D r    = CATransform3DRotate(p, ang, 0.0f, 1.0f, 0.0f);
-        ((UIView *)s).layer.transform = CATransform3DMultiply(r, base);
+        ((UIView *)s).layer.transform = CATransform3DConcat(r, base);
     });
     method_setImplementation(m, repl);
     NSLog(@"[26Anim] skew: swizzled SBFullscreenZoomView setTransform:");
