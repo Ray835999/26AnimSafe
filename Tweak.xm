@@ -67,7 +67,7 @@ static double gDuration     = 0.45;   // short-transition duration cap (folder z
 // fading to flat as it reaches fullscreen (no lingering tilt). If your device's
 // app-open path does NOT use SBFullscreenZoomView, this is a safe no-op.
 static BOOL   gSkewEnabled  = YES;    // DEFAULT ON — the iOS 26 app open/close tilt
-static double gSkewAngle    = 8.0;    // peak tilt in degrees at the start of the zoom
+static double gSkewAngle    = 12.0;   // peak tilt in degrees at the start of the zoom
 
 // ---------- throttled log flags ----------
 static BOOL gLoggedResp = NO;
@@ -138,91 +138,92 @@ static void swizzleDoubleSetter(const char *clsName, const char *selName,
     NSLog(@"[26Anim] swizzled %s %s -> force %.3f", clsName, selName, val);
 }
 
-// ---------- experimental skew swizzle (type-safe) ----------
-// ROOT CAUSE OF v1.0.2 SAFE MODE:
-//   SBFullscreenZoomView may declare -setTransform: with EITHER a CGAffineTransform
-//   (the stock UIView affine setter) OR a CATransform3D (a 3D override). v1.0.2
-//   assumed the affine signature unconditionally. On iOS 15.8.8 the class uses the
-//   3D signature, so the C block read the wrong registers -> ABI mismatch ->
-//   crash -> SafeMode.
+// ---------- iOS 26 perspective-tilt (app open/close), v1.0.5 ----------
+// WHY v1.0.2..1.0.4 did NOTHING visible:
+//   They hooked SBFullscreenZoomView -setTransform:. On this device the app-open
+//   zoom either (a) does not use that class, or (b) drives its layer.transform
+//   DIRECTLY, bypassing the view setter. So the hook never fired -> no tilt, and
+//   (in 1.0.2) the affine-vs-3D ABI mismatch crashed instead.
 //
-// FIX:
-//   (1) Only hook if the method is OWNED by SBFullscreenZoomView (never inherit and
-//       globally mutate UIView's setTransform:).
-//   (2) Inspect method_getTypeEncoding and install a repl whose block argument type
-//       matches the real signature (CGAffineTransform vs CATransform3D). The wrong
-//       type can therefore never be installed -> no ABI crash.
-//   Pure no-op when gSkewEnabled = NO, so it still cannot by itself cause SafeMode.
-static BOOL classOwnsSelector(Class cls, SEL sel) {
-    if (cls == Nil) return NO;
-    unsigned n = 0;
-    Method *list = class_copyMethodList(cls, &n);
-    BOOL found = NO;
-    for (unsigned i = 0; i < n; i++) {
-        if (method_getName(list[i]) == sel) { found = YES; break; }
+// NEW APPROACH (robust, zero-ambiguity):
+//   Hook CALayer -setTransform: GLOBALLY, but only actually tilt when the layer's
+//   delegate (the owning UIView) is an app-open/close zoom view. CALayer
+//   -setTransform: is ALWAYS CATransform3D, so there is no signature ambiguity and
+//   it can never cause the v1.0.2 crash. Every other layer passes straight through
+//   to the original implementation -> zero side effects elsewhere.
+//
+//   We identify the owning view by class (isKindOfClass on a cached candidate
+//   list) and, as a safety net, by class-name substring (Zoom/Snapshot/IconZoom)
+//   so subclasses the list missed are still caught. The first time a tilt is
+//   applied we log the class name + scale so we can EMPIRICALLY confirm which view
+//   drives the animation on the user's device.
+static Class gZoomClasses[8];
+static int   gZoomCount = 0;
+static BOOL  gSkewFiredLogged = NO;
+
+static void cacheZoomClasses(void) {
+    const char *names[] = {
+        "SBFullscreenZoomView",
+        "SBAppSwitcherIconZoomView",
+        "SBAppSwitcherZoomView",
+        "SBIconZoomView",
+        "SBAppSwitcherReusableSnapshotView",
+        "SBZoomView"
+    };
+    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+        Class c = objc_getClass(names[i]);
+        if (c) {
+            gZoomClasses[gZoomCount++] = c;
+            NSLog(@"[26Anim] skew: candidate %s FOUND", names[i]);
+        } else {
+            NSLog(@"[26Anim] skew: candidate %s absent", names[i]);
+        }
     }
-    if (list) free(list);
-    return found;
+}
+
+static BOOL isZoomLayer(id layer) {
+    id del = [layer delegate];
+    if (del == nil) return NO;
+    for (int i = 0; i < gZoomCount; i++) {
+        if ([del isKindOfClass:gZoomClasses[i]]) return YES;
+    }
+    NSString *nm = NSStringFromClass([del class]);
+    if ([nm containsString:@"Zoom"] ||
+        [nm containsString:@"Snapshot"] ||
+        [nm containsString:@"IconZoom"]) {
+        return YES;
+    }
+    return NO;
 }
 
 static void swizzleSkew(void) {
-    Class cls = objc_getClass("SBFullscreenZoomView");
-    if (cls == Nil) {
-        NSLog(@"[26Anim] skew: SBFullscreenZoomView not found, skip");
-        return;
-    }
+    cacheZoomClasses();
+    Class cls = objc_getClass("CALayer");
+    if (cls == Nil) { NSLog(@"[26Anim] skew: CALayer not found?!"); return; }
     SEL sel = sel_registerName("setTransform:");
-    if (!classOwnsSelector(cls, sel)) {
-        // setTransform: is inherited from UIView; do NOT globally mutate UIView.
-        NSLog(@"[26Anim] skew: setTransform: not owned by SBFullscreenZoomView, skip (safe)");
-        return;
-    }
     Method m = class_getInstanceMethod(cls, sel);
-    if (m == NULL) {
-        NSLog(@"[26Anim] skew: setTransform: null, skip");
-        return;
-    }
-    const char *enc = method_getTypeEncoding(m);
-    BOOL is3D = NO;
-    if (enc) {
-        NSString *e = [NSString stringWithUTF8String:enc];
-        is3D = [e containsString:@"CATransform3D"];
-    }
+    if (m == NULL) { NSLog(@"[26Anim] skew: CALayer setTransform: not found?!"); return; }
     IMP orig = method_getImplementation(m);
-    IMP repl;
-    if (is3D) {
-        repl = imp_implementationWithBlock(^void(id s, SEL c, CATransform3D t) {
-            typedef void (*SetT)(id, SEL, CATransform3D);
-            SetT o = (SetT)orig;
-            o(s, c, t);                        // original 3D transform applied first
-            if (!gSkewEnabled) return;
-            CGFloat sc = (CGFloat)fabs(t.m11);
-            if (sc <= 0.001f || sc >= 1.0f) return;   // only mid-flight zoom
-            CGFloat ang = gSkewAngle * (1.0f - sc) * (CGFloat)(3.141592653589793 / 180.0);
-            CATransform3D p = CATransform3DIdentity;
-            p.m34 = -1.0f / 700.0f;            // perspective (near-bigger)
-            CATransform3D r = CATransform3DRotate(p, ang, 0.0f, 1.0f, 0.0f);
-            ((UIView *)s).layer.transform = CATransform3DConcat(r, t);
-        });
-        NSLog(@"[26Anim] skew: swizzled setTransform: (CATransform3D)");
-    } else {
-        repl = imp_implementationWithBlock(^void(id s, SEL c, CGAffineTransform t) {
-            typedef void (*SetT)(id, SEL, CGAffineTransform);
-            SetT o = (SetT)orig;
-            o(s, c, t);                        // original affine transform applied first
-            if (!gSkewEnabled) return;
-            CGFloat sc = (CGFloat)fabs(t.a);
-            if (sc <= 0.001f || sc >= 1.0f) return;   // only mid-flight zoom
-            CGFloat ang = gSkewAngle * (1.0f - sc) * (CGFloat)(3.141592653589793 / 180.0);
-            CATransform3D base = CATransform3DMakeAffineTransform(t);
-            CATransform3D p = CATransform3DIdentity;
-            p.m34 = -1.0f / 700.0f;            // perspective (near-bigger)
-            CATransform3D r = CATransform3DRotate(p, ang, 0.0f, 1.0f, 0.0f);
-            ((UIView *)s).layer.transform = CATransform3DConcat(r, base);
-        });
-        NSLog(@"[26Anim] skew: swizzled setTransform: (CGAffineTransform)");
-    }
+    IMP repl = imp_implementationWithBlock(^void(id s, SEL c, CATransform3D t) {
+        typedef void (*SetT)(id, SEL, CATransform3D);
+        SetT o = (SetT)orig;
+        if (!gSkewEnabled || !isZoomLayer(s)) { o(s, c, t); return; }
+        CGFloat sc = (CGFloat)fabs(t.m11);
+        if (sc <= 0.005f || sc >= 0.999f) { o(s, c, t); return; }   // only mid-flight zoom
+        CGFloat ang = gSkewAngle * (1.0f - sc) * (CGFloat)(3.141592653589793 / 180.0);
+        CATransform3D p = CATransform3DIdentity;
+        p.m34 = -1.0f / 350.0f;            // perspective (iOS 26-ish, stronger than before)
+        CATransform3D r = CATransform3DRotate(p, ang, 0.0f, 1.0f, 0.0f);
+        if (!gSkewFiredLogged) {
+            gSkewFiredLogged = YES;
+            NSLog(@"[26Anim] skew: FIRED on %@ scale=%.3f angle=%.2f",
+                  NSStringFromClass([(id)[s delegate] class]),
+                  sc, ang * 180.0 / 3.141592653589793);
+        }
+        o(s, c, CATransform3DConcat(r, t));   // set once via original IMP -> no recursion
+    });
     method_setImplementation(m, repl);
+    NSLog(@"[26Anim] skew: swizzled CALayer setTransform: (global, delegate-guarded)");
 }
 
 %ctor {
