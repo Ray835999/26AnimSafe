@@ -31,33 +31,42 @@
 // fired and which value was forced:
 //   log stream --predicate 'process == "SpringBoard"' | grep 26Anim
 //
-// Preferences (read from BOTH the legacy 26Anim domain and this package's domain):
-//   /var/jb/var/mobile/Library/Preferences/com.ngkhoi.26anim.plist
+// Preferences (this package's domain only; the legacy com.ngkhoi.26anim domain is
+// no longer read, so it can no longer accidentally turn the spring mods on):
 //   /var/jb/var/mobile/Library/Preferences/com.you.26animsafe.plist
-//     enabled      (BOOL, default YES)
-//     animSpeed    ("Original" disables the tweak; anything else -> enabled)
-//     response     (double, fluid response seconds; default 0.50 -> slow iOS26 zoom)
-//     dampingRatio (double, 0.2..1.0; default 0.72 -> gentle bounce)
-//     duration     (double, short-transition duration seconds; default 0.45)
+//   (or /var/mobile/Library/Preferences/com.you.26animsafe.plist on rootless)
+//
+//   1.0.4 DEFAULTS (per request): iOS 26 tilt ON, slow/bounce spring OFF.
+//     skewEnabled  (BOOL, default YES) — THE iOS 26 app open/close perspective tilt
+//     skewAngle    (double, peak tilt degrees; default 8.0)
+//     enabled      (BOOL, default NO)  — master for the *extra* slow/bounce spring mods
+//     response     (double, fluid response seconds; default 0.45; needs enabled=true)
+//     dampingRatio (double, 0.2..1.0; default 1.0 = no bounce; needs enabled=true)
+//     duration     (double, short-transition duration seconds; default 0.45; needs enabled=true)
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <CoreFoundation/CoreFoundation.h>
 
 // ---------- tunables ----------
-static BOOL   gEnabled      = YES;
+// Per user request (26AnimSafe 1.0.4):
+//   * The iOS 26-style perspective-tilt app open/close animation is the PRIMARY
+//     feature and is ON by default (gSkewEnabled = YES).
+//   * The slow/bounce spring modifications (response / dampingRatio / duration)
+//     are "extras" and are OFF by default (gEnabled = NO). Set enabled=true in the
+//     plist (or the Settings toggle) to also slow the zoom / change damping.
+static BOOL   gEnabled      = NO;     // master for slow/bounce spring mods — OFF by default
 static double gResponse     = 0.45;   // larger = slower/open (iOS 26 feel). stock ~0.37
 static double gDampingRatio = 1.0;    // 1.0 = critically damped (NO overshoot/bounce). stock ~1.0
 static double gDuration     = 0.45;   // short-transition duration cap (folder zoom etc.)
 
-// ---------- experimental skew (iOS 26-style perspective tilt) ----------
-// EXPERIMENTAL. Off by default (gSkewEnabled = NO). When enabled we hook
-// SBFullscreenZoomView -setTransform: and, while the app-open zoom is mid-flight
-// (scale < 1.0), re-apply the transform with a perspective (m34) plus a decaying
-// rotateY so the icon appears to swing in on a 3D plane. Angle fades to 0 as the
-// view reaches fullscreen, so there is no lingering tilt. If your device's
+// ---------- iOS 26 perspective-tilt (app open/close) ----------
+// ON by default. Hooks SBFullscreenZoomView -setTransform: and, while the app-open
+// (and close) zoom is mid-flight (scale < 1.0), re-applies the transform with a
+// perspective (m34) plus a decaying rotateY so the icon swings in on a 3D plane,
+// fading to flat as it reaches fullscreen (no lingering tilt). If your device's
 // app-open path does NOT use SBFullscreenZoomView, this is a safe no-op.
-static BOOL   gSkewEnabled  = NO;     // default OFF — set true in plist to try
+static BOOL   gSkewEnabled  = YES;    // DEFAULT ON — the iOS 26 app open/close tilt
 static double gSkewAngle    = 8.0;    // peak tilt in degrees at the start of the zoom
 
 // ---------- throttled log flags ----------
@@ -87,8 +96,6 @@ static void loadPrefsFrom(NSString *path) {
 }
 
 static void loadPrefs(void) {
-    loadPrefsFrom(@"/var/jb/var/mobile/Library/Preferences/com.ngkhoi.26anim.plist");
-    loadPrefsFrom(@"/var/mobile/Library/Preferences/com.ngkhoi.26anim.plist");
     loadPrefsFrom(@"/var/jb/var/mobile/Library/Preferences/com.you.26animsafe.plist");
     loadPrefsFrom(@"/var/mobile/Library/Preferences/com.you.26animsafe.plist");
 }
@@ -188,7 +195,7 @@ static void swizzleSkew(void) {
             typedef void (*SetT)(id, SEL, CATransform3D);
             SetT o = (SetT)orig;
             o(s, c, t);                        // original 3D transform applied first
-            if (!gEnabled || !gSkewEnabled) return;
+            if (!gSkewEnabled) return;
             CGFloat sc = (CGFloat)fabs(t.m11);
             if (sc <= 0.001f || sc >= 1.0f) return;   // only mid-flight zoom
             CGFloat ang = gSkewAngle * (1.0f - sc) * (CGFloat)(3.141592653589793 / 180.0);
@@ -203,7 +210,7 @@ static void swizzleSkew(void) {
             typedef void (*SetT)(id, SEL, CGAffineTransform);
             SetT o = (SetT)orig;
             o(s, c, t);                        // original affine transform applied first
-            if (!gEnabled || !gSkewEnabled) return;
+            if (!gSkewEnabled) return;
             CGFloat sc = (CGFloat)fabs(t.a);
             if (sc <= 0.001f || sc >= 1.0f) return;   // only mid-flight zoom
             CGFloat ang = gSkewAngle * (1.0f - sc) * (CGFloat)(3.141592653589793 / 180.0);
@@ -223,10 +230,6 @@ static void swizzleSkew(void) {
         loadPrefs();
 
         // Live reload when the user toggles in Settings (the pane posts this Darwin note).
-        CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged,
-            CFSTR("com.ngkhoi.26anim/settingschanged"), NULL,
-            CFNotificationSuspensionBehaviorCoalesce);
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged,
             CFSTR("com.you.26animsafe/settingschanged"), NULL,
