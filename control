@@ -1,6 +1,6 @@
 Package: com.you.26animsafe
 Name: 26AnimSafe (Fluid Open/Close)
-Version: 1.0.3
+Version: 1.0.4
 Architecture: iphoneos-arm64
 Description: iOS 26-style app open/close interrupt zoom for iOS 13-16 (rootless). Hooks SBFFluidBehaviorSettings -setResponse:/-setDampingRatio: (the real fluid-behavior surface that drives the zoom, NOT the SBHIconZoomSettings tree v3/v4 wrongly targeted) for a slow, springy iOS 26 feel. Bonus: slows short SBFAnimationSettings transitions. Crash-proof Logos hooks + throttled [26Anim] syslog.
 Depends: mobilesubstrate
