@@ -227,8 +227,10 @@ static UIView *skewTargetView(id animator) {
 
 static double tiltDuration(id animator) {
     @try {
-        id st = Msg(animator, "settings");
-        if (st) {
+        const char *sn[] = { "animationSettings", "settings" };
+        for (int i = 0; i < 2; i++) {
+            id st = Msg(animator, sn[i]);
+            if (!st) continue;
             SEL ds = sel_registerName("duration");
             if ([st respondsToSelector:ds]) {
                 double d = ((double (*)(id, SEL))objc_msgSend)(st, ds);
@@ -239,42 +241,43 @@ static double tiltDuration(id animator) {
     return 0.45;
 }
 
-// ---------------- the tilt itself ----------------
-static void addTilt(UIView *v, double dur) {
+// ---------------- the tilt (v1.0.9) ----------------
+// WHY v1.0.8 ADDED THE TILT BUT NOTHING WAS VISIBLE:
+//   SpringBoard runs its own CABasicAnimation on the FULL "transform" keyPath for
+//   the zooming view. A full-"transform" animation OVERRIDES auxiliary components
+//   such as "transform.rotation.y", so our tilt was silently discarded.
+// FIX: animate the PARENT layer's "sublayerTransform" instead. sublayerTransform
+//   COMPOSES with each child's own transform (parent.sublayerTransform x child.transform)
+//   rather than competing with it, so it survives the system animation and always shows.
+static void applyTilt(UIView *container, double dur) {
     @try {
-        if (!v) return;
-        CALayer *parent = v.layer.superlayer;
-        if (parent) {
-            CATransform3D persp = CATransform3DIdentity;
-            persp.m34 = -1.0f / 500.0f;
-            parent.sublayerTransform = persp;
-        }
-        CABasicAnimation *rot = [CABasicAnimation animationWithKeyPath:@"transform.rotation.y"];
-        rot.fromValue = [NSNumber numberWithDouble:gSkewAngle * (3.141592653589793 / 180.0)];
-        rot.toValue   = [NSNumber numberWithDouble:0.0];
-        rot.duration  = dur;
-        rot.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        rot.removedOnCompletion = YES;
-        [v.layer addAnimation:rot forKey:@"26anim_tilt"];
+        if (!container) return;
+        CATransform3D persp = CATransform3DIdentity;
+        persp.m34 = -1.0f / 500.0f;
+        CATransform3D from = CATransform3DRotate(persp, gSkewAngle * (3.141592653589793 / 180.0),
+                                                 0.0f, 1.0f, 0.0f);
+        CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"sublayerTransform"];
+        a.fromValue = [NSValue valueWithCATransform3D:from];
+        a.toValue   = [NSValue valueWithCATransform3D:CATransform3DIdentity];
+        a.duration  = dur;
+        a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        a.removedOnCompletion = YES;
+        [container.layer addAnimation:a forKey:@"26anim_tilt"];
         if (!gSkewFiredLogged) {
             gSkewFiredLogged = YES;
-            Diag([NSString stringWithFormat:@"TILT ADDED view=%@ dur=%.3f angle=%.1f",
-                  NSStringFromClass([v class]), dur, gSkewAngle]);
+            Diag([NSString stringWithFormat:@"TILT(sublayerTransform) on %@ dur=%.3f angle=%.1f",
+                  NSStringFromClass([container class]), dur, gSkewAngle]);
         }
-    } @catch (...) { Diag(@"addTilt threw"); }
+    } @catch (...) { Diag(@"applyTilt threw"); }
 }
 
-static void removeTilt(UIView *v) {
-    @try {
-        if (!v) return;
-        [v.layer removeAnimationForKey:@"26anim_tilt"];
-        CALayer *parent = v.layer.superlayer;
-        if (parent) parent.sublayerTransform = CATransform3DIdentity;
-    } @catch (...) { }
+static void removeTiltFrom(UIView *container) {
+    @try { if (container) [container.layer removeAnimationForKey:@"26anim_tilt"]; }
+    @catch (...) { }
 }
 
 // ---------------- hooks ----------------
-// -(void)xxx  no arguments -> zero ABI risk
+// -(void)xxx with NO arguments -> zero ABI risk
 static void hookVoid(const char *clsName, const char *selName, BOOL isPrepare) {
     Class cls = objc_getClass(clsName);
     if (!cls) { Diag([NSString stringWithFormat:@"class %s absent", clsName]); return; }
@@ -287,20 +290,17 @@ static void hookVoid(const char *clsName, const char *selName, BOOL isPrepare) {
         repl = imp_implementationWithBlock(^void(id s, SEL c) {
             ((void (*)(id, SEL))orig)(s, c);
             @try {
-                Diag([NSString stringWithFormat:@"PREPARE on %@", NSStringFromClass([s class])]);
-                if (!gSkewEnabled) { Diag(@"prepare: skew disabled"); return; }
-                UIView *v = skewTargetView(s);
-                if (!v) { Diag(@"prepare: NO VIEW FOUND"); return; }
-                addTilt(v, tiltDuration(s));
-            } @catch (...) { Diag(@"prepare threw"); }
+                // diagnostics only: the v1.0.8 log proved these are lockscreen/folder
+                // animations, NOT app open, so we no longer tilt here.
+                Diag([NSString stringWithFormat:@"PREPARE on %@ (no tilt)", NSStringFromClass([s class])]);
+            } @catch (...) { }
         });
     } else {
         repl = imp_implementationWithBlock(^void(id s, SEL c) {
             ((void (*)(id, SEL))orig)(s, c);
             @try {
-                Diag([NSString stringWithFormat:@"CLEANUP on %@", NSStringFromClass([s class])]);
-                if (!gSkewEnabled) return;
-                removeTilt(skewTargetView(s));
+                id cv = Msg(s, "containerView");
+                if ([cv isKindOfClass:[UIView class]]) removeTiltFrom((UIView *)cv);
             } @catch (...) { }
         });
     }
@@ -308,7 +308,7 @@ static void hookVoid(const char *clsName, const char *selName, BOOL isPrepare) {
     Diag([NSString stringWithFormat:@"hooked %s %s", clsName, selName]);
 }
 
-// -(void)xxx:(double)  diagnostics only (how often does it really fire?)
+// -(void)xxx:(double)  diagnostics only
 static void hookTick(const char *clsName, const char *selName) {
     Class cls = objc_getClass(clsName);
     if (!cls) { Diag([NSString stringWithFormat:@"tick class %s absent", clsName]); return; }
@@ -316,7 +316,7 @@ static void hookTick(const char *clsName, const char *selName) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) { Diag([NSString stringWithFormat:@"tick %s %s absent", clsName, selName]); return; }
     const char *enc = method_getTypeEncoding(m);
-    if (!enc || !strstr(enc, ":8d")) {   // refuse anything that is not a plain double arg
+    if (!enc || !strstr(enc, ":8d")) {
         Diag([NSString stringWithFormat:@"tick %s %s enc=%s skipped", clsName, selName, enc?enc:"(null)"]);
         return;
     }
@@ -329,18 +329,68 @@ static void hookTick(const char *clsName, const char *selName) {
     Diag([NSString stringWithFormat:@"hooked tick %s %s", clsName, selName]);
 }
 
+// THE app open/close driver: SBUIAnimationController (base of
+// SBUIWorkspaceAnimationController -> SBUIBlockAnimationController ->
+// SBFluidSwitcherAnimationController). -isFluidSwitcherAnimationController is YES
+// exactly for the app<->home transitions, so we use it to target app open/close only.
+static void hookUIAnimationController(void) {
+    Class cls = objc_getClass("SBUIAnimationController");
+    if (!cls) { Diag(@"SBUIAnimationController ABSENT"); return; }
+    SEL fsSel = sel_registerName("isFluidSwitcherAnimationController");
+
+    SEL s1 = sel_registerName("_startAnimation");
+    Method m1 = class_getInstanceMethod(cls, s1);
+    if (m1) {
+        IMP orig = method_getImplementation(m1);
+        IMP repl = imp_implementationWithBlock(^void(id s, SEL c) {
+            ((void (*)(id, SEL))orig)(s, c);
+            @try {
+                BOOL fluid = NO;
+                if ([s respondsToSelector:fsSel])
+                    fluid = ((BOOL (*)(id, SEL))objc_msgSend)(s, fsSel);
+                id cv = Msg(s, "containerView");
+                id tr = Msg(s, "transition");
+                Diag([NSString stringWithFormat:@"START %@ fluid=%d container=%@ transition=%@",
+                      NSStringFromClass([s class]), (int)fluid,
+                      cv ? NSStringFromClass([cv class]) : @"(nil)",
+                      tr ? NSStringFromClass([tr class]) : @"(nil)"]);
+                if (!gSkewEnabled) { Diag(@"start: skew disabled"); return; }
+                if (!fluid) { Diag(@"start: not fluid switcher -> skip"); return; }
+                if (![cv isKindOfClass:[UIView class]]) { Diag(@"start: no containerView"); return; }
+                applyTilt((UIView *)cv, tiltDuration(s));
+            } @catch (...) { Diag(@"_startAnimation threw"); }
+        });
+        method_setImplementation(m1, repl);
+        Diag(@"hooked SBUIAnimationController _startAnimation");
+    } else {
+        Diag(@"SBUIAnimationController _startAnimation ABSENT");
+    }
+
+    SEL s2 = sel_registerName("_cleanupAnimation");
+    Method m2 = class_getInstanceMethod(cls, s2);
+    if (m2) {
+        IMP orig = method_getImplementation(m2);
+        IMP repl = imp_implementationWithBlock(^void(id s, SEL c) {
+            ((void (*)(id, SEL))orig)(s, c);
+            @try {
+                id cv = Msg(s, "containerView");
+                if ([cv isKindOfClass:[UIView class]]) removeTiltFrom((UIView *)cv);
+            } @catch (...) { }
+        });
+        method_setImplementation(m2, repl);
+        Diag(@"hooked SBUIAnimationController _cleanupAnimation");
+    }
+}
+
 static void swizzleSkew(void) {
     DiagInit();
-    Diag([NSString stringWithFormat:@"ctor start skewEnabled=%d angle=%.1f", gSkewEnabled, gSkewAngle]);
-    // Hook the BASE class once: subclasses (SBScaleIconZoomAnimator,
-    // SBCenterIconZoomAnimator, ...) inherit it, so we cover the whole family
-    // without double-swizzling the same Method (which would recurse).
+    Diag([NSString stringWithFormat:@"ctor v1.0.9 skewEnabled=%d angle=%.1f", gSkewEnabled, gSkewAngle]);
+    // Primary: the real app open/close animation controller family.
+    hookUIAnimationController();
+    // Secondary: kept for diagnostics (proven to be lockscreen/folder only).
     hookVoid("SBIconAnimator", "prepare", YES);
     hookVoid("SBIconAnimator", "cleanup", NO);
-    // per-frame ticks: diagnostics only, to prove whether they run at all
     hookTick("SBScaleIconZoomAnimator", "_applyZoomFraction:");
-    hookTick("SBScaleIconZoomAnimator", "_setAnimationFraction:");
-    hookTick("SBIconZoomAnimator", "_setAnimationFraction:");
     DiagFlush();
 }
 
