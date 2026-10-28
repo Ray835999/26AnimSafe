@@ -210,21 +210,6 @@ static id Msg(id o, const char *name) {
     @try { return ((id (*)(id, SEL))objc_msgSend)(o, s); } @catch (...) { return nil; }
 }
 
-static UIView *skewTargetView(id animator) {
-    // ordered: prefer a single icon view, fall back to the container
-    const char *names[] = { "targetIconView", "referenceIconView",
-                            "targetIconContainerView", "referenceView",
-                            "animationContainer" };
-    for (int i = 0; i < 5; i++) {
-        id v = Msg(animator, names[i]);
-        if (v && [v isKindOfClass:[UIView class]]) {
-            Diag([NSString stringWithFormat:@"view via %s -> %@", names[i], NSStringFromClass([v class])]);
-            return (UIView *)v;
-        }
-    }
-    return nil;
-}
-
 static double tiltDuration(id animator) {
     @try {
         const char *sn[] = { "animationSettings", "settings" };
