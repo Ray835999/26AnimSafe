@@ -61,11 +61,10 @@ static double gDampingRatio = 1.0;    // 1.0 = critically damped (NO overshoot/b
 static double gDuration     = 0.45;   // short-transition duration cap (folder zoom etc.)
 
 // ---------- iOS 26 perspective-tilt (app open/close) ----------
-// ON by default. Hooks SBFullscreenZoomView -setTransform: and, while the app-open
-// (and close) zoom is mid-flight (scale < 1.0), re-applies the transform with a
-// perspective (m34) plus a decaying rotateY so the icon swings in on a 3D plane,
-// fading to flat as it reaches fullscreen (no lingering tilt). If your device's
-// app-open path does NOT use SBFullscreenZoomView, this is a safe no-op.
+// ON by default. Hooks SBIconZoomAnimator / SBScaleIconZoomAnimator per-frame tick
+// (-_setAnimationFraction: / -_applyZoomFraction:), and re-applies a perspective
+// (m34) plus a decaying rotateY to the animator's own target icon view so the icon
+// swings in on a 3D plane, flattening as it reaches fullscreen.
 static BOOL   gSkewEnabled  = YES;    // DEFAULT ON — the iOS 26 app open/close tilt
 static double gSkewAngle    = 12.0;   // peak tilt in degrees at the start of the zoom
 
@@ -138,121 +137,110 @@ static void swizzleDoubleSetter(const char *clsName, const char *selName,
     NSLog(@"[26Anim] swizzled %s %s -> force %.3f", clsName, selName, val);
 }
 
-// ---------- iOS 26 perspective-tilt (app open/close), v1.0.6 ----------
-// WHY v1.0.5 CRASHED (root cause, now fixed):
-//   It hooked CALayer -setTransform: GLOBALLY. That fires on EVERY layer in the
-//   whole OS. Reading [layer delegate] / NSStringFromClass on each call (a) thrashes
-//   the main thread on a slow device, and (b) messages the layer's delegate which
-//   is unsafe_unretained and can be a stale/freed pointer during rapid animation
-//   teardown -> EXC_BAD_ACCESS -> SafeMode.
+// ---------- iOS 26 perspective-tilt (app open/close), v1.0.7 ----------
+// EMPIRICAL FINDINGS from the iOS 15.8.8 runtime class index (128103 classes):
+//   * SBZoomView / SBFullscreenZoomView do NOT implement -setTransform: and have no
+//     scale property at all (only init/contentView/statusBar). That is exactly why
+//     v1.0.4 (SBFullscreenZoomView setTransform:) and v1.0.6 (name-scanned Zoom views)
+//     produced NO visible tilt: the hook could install, but the animation never
+//     calls those methods -- the animator drives the frame from outside.
+//   * The real driver is SBIconZoomAnimator (SpringBoardHome) and its subclass
+//     SBScaleIconZoomAnimator, which implements:
+//        - (void)_setAnimationFraction:(double)fraction   // base class, every frame
+//        - (void)_applyZoomFraction:(double)fraction      // SBScale*, every frame
+//        - (void)_setZoomScale:(double)scale
+//        - (void)_applyVisualAltitudeFraction:(double)f
+//     `fraction` runs 0..1 while the icon zooms up into the app (and 1..0 on close).
 //
-// SAFE DESIGN (v1.0.6):
-//   We no longer touch CALayer. Instead, at load we scan the runtime for VIEW
-//   classes whose name contains Zoom / IconZoom / Snapshot (these are the
-//   app-open/close zoom views) and add a -setTransform: override to THOSE classes
-//   ONLY via class_addMethod, so UIView itself is never mutated globally. The
-//   signature (CGAffineTransform vs CATransform3D) is detected per class, so there
-//   is no ABI mismatch (the v1.0.2 crash class). The override applies the original
-//   transform, then writes the *layer* transform with a perspective + decaying
-//   rotateY. Writing the layer (not the view) means we never re-enter the hooked
-//   view setter -> no recursion. Every other view passes straight through.
+// v1.0.7 DESIGN (no crash surface at all):
+//   Hook ONLY the animator, never layers, never global UIKit, never the heuristic
+//   name scan. On each fraction tick we take the animator's *own* target icon view
+//   (targetIconView / referenceIconView) and apply a perspective+rotateY to that
+//   one view's layer -- the single view we know is on screen for THIS animation.
+//   Everything is wrapped in @try and null-checked; all arguments are plain double,
+//   so there is no ABI-signature hazard. If the classes/methods are absent we log
+//   and do nothing (safe no-op).
 static BOOL gSkewFiredLogged = NO;
 
-static BOOL isUIViewSubclass(Class cls) {
-    Class uv = objc_getClass("UIView");
-    Class c = cls;
-    while (c != Nil) {
-        if (c == uv) return YES;
-        c = class_getSuperclass(c);
-    }
-    return NO;
+// Find a UIView on the animator to tilt: SBScaleIconZoomAnimator exposes
+// -targetIconView and -referenceIconView (both UIView*). We try those via
+// respondsToSelector/NSSelectorFromString so nothing is hard-linked.
+static UIView *skewTargetView(id animator) {
+    @try {
+        SEL sels[3] = {
+            NSSelectorFromString(@"targetIconView"),
+            NSSelectorFromString(@"referenceIconView"),
+            NSSelectorFromString(@"targetIconContainerView")
+        };
+        for (int i = 0; i < 3; i++) {
+            if (![animator respondsToSelector:sels[i]]) continue;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id v = [animator performSelector:sels[i]];
+#pragma clang diagnostic pop
+            if (v && [v isKindOfClass:[UIView class]]) return (UIView *)v;
+        }
+    } @catch (...) { }
+    return nil;
 }
 
-static BOOL zoomNameMatch(const char *name) {
-    if (!name) return NO;
-    if (strstr(name, "Zoom")    != NULL) return YES;
-    if (strstr(name, "IconZoom") != NULL) return YES;
-    if (strstr(name, "Snapshot") != NULL) return YES;
-    return NO;
+// fraction 0..1 (0 = icon in grid, 1 = app fullscreen). Tilt peaks mid-flight.
+static void applySkewToAnimator(id animator, double fraction) {
+    if (!gSkewEnabled) return;
+    if (fraction <= 0.02 || fraction >= 0.985) return;   // only mid-flight
+    UIView *v = skewTargetView(animator);
+    if (v == nil) return;
+    @try {
+        // Peak at ~30% progress, fade to 0 at both ends so the end state is flat.
+        double f = fraction;
+        double curve = (f < 0.3) ? (f / 0.3) : ((1.0 - f) / 0.7);
+        if (curve <= 0.0) return;
+        double ang = gSkewAngle * curve * (3.141592653589793 / 180.0);
+        CATransform3D p = CATransform3DIdentity;
+        p.m34 = -1.0f / 350.0f;                  // perspective
+        CATransform3D r = CATransform3DRotate(p, ang, 0.0f, 1.0f, 0.0f);
+        v.layer.transform = r;                   // write the LAYER, not the view setter
+        if (!gSkewFiredLogged) {
+            gSkewFiredLogged = YES;
+            NSLog(@"[26Anim] skew: FIRED on %@ fraction=%.3f angle=%.2f",
+                  NSStringFromClass([v class]), fraction, ang * 180.0 / 3.141592653589793);
+        }
+    } @catch (...) { }
 }
 
-static void addSkewToClass(Class cls, SEL sel) {
-    if (!isUIViewSubclass(cls)) return;          // only UIView subclasses have a real .layer
+// Hook a -(void)xxx:(double) method on clsName that ticks the zoom animation.
+static void swizzleZoomTick(const char *clsName, const char *selName) {
+    Class cls = objc_getClass(clsName);
+    if (cls == Nil) { NSLog(@"[26Anim] skew: %s absent, skip", clsName); return; }
+    SEL sel = sel_registerName(selName);
     Method m = class_getInstanceMethod(cls, sel);
-    if (m == NULL) return;
+    if (m == NULL) { NSLog(@"[26Anim] skew: %s %s absent, skip", clsName, selName); return; }
     const char *enc = method_getTypeEncoding(m);
-    if (enc == NULL) return;
-    BOOL is3D = (strstr(enc, "CATransform3D") != NULL);
+    if (enc == NULL || strstr(enc, "d") == NULL) {
+        // Signature is not (double) -- refuse rather than risk an ABI mismatch.
+        NSLog(@"[26Anim] skew: %s %s enc=%s unexpected, skip", clsName, selName, enc ? enc : "(null)");
+        return;
+    }
     IMP orig = method_getImplementation(m);
-
-    IMP repl;
-    if (is3D) {
-        repl = imp_implementationWithBlock(^void(id s, SEL c, CATransform3D t) {
-            typedef void (*SetT)(id, SEL, CATransform3D);
-            SetT o = (SetT)orig;
-            o(s, c, t);                          // original 3D transform
-            if (!gSkewEnabled) return;
-            CGFloat sc = (CGFloat)fabs(t.m11);
-            if (sc <= 0.005f || sc >= 0.999f) return;   // only mid-flight zoom
-            CGFloat ang = gSkewAngle * (1.0f - sc) * (CGFloat)(3.141592653589793 / 180.0);
-            CATransform3D p = CATransform3DIdentity;
-            p.m34 = -1.0f / 350.0f;              // perspective (iOS 26-ish)
-            CATransform3D r = CATransform3DRotate(p, ang, 0.0f, 1.0f, 0.0f);
-            ((UIView *)s).layer.transform = CATransform3DConcat(r, t);
-            if (!gSkewFiredLogged) {
-                gSkewFiredLogged = YES;
-                NSLog(@"[26Anim] skew: FIRED(3D) on %@ scale=%.3f angle=%.2f",
-                      NSStringFromClass([(id)s class]), sc, ang * 180.0 / 3.141592653589793);
-            }
-        });
-    } else {
-        repl = imp_implementationWithBlock(^void(id s, SEL c, CGAffineTransform t) {
-            typedef void (*SetT)(id, SEL, CGAffineTransform);
-            SetT o = (SetT)orig;
-            o(s, c, t);                          // original affine transform
-            if (!gSkewEnabled) return;
-            CGFloat sc = (CGFloat)fabs(t.a);
-            if (sc <= 0.005f || sc >= 0.999f) return;   // only mid-flight zoom
-            CGFloat ang = gSkewAngle * (1.0f - sc) * (CGFloat)(3.141592653589793 / 180.0);
-            CATransform3D base = CATransform3DMakeAffineTransform(t);
-            CATransform3D p = CATransform3DIdentity;
-            p.m34 = -1.0f / 350.0f;              // perspective (iOS 26-ish)
-            CATransform3D r = CATransform3DRotate(p, ang, 0.0f, 1.0f, 0.0f);
-            ((UIView *)s).layer.transform = CATransform3DConcat(r, base);
-            if (!gSkewFiredLogged) {
-                gSkewFiredLogged = YES;
-                NSLog(@"[26Anim] skew: FIRED(2D) on %@ scale=%.3f angle=%.2f",
-                      NSStringFromClass([(id)s class]), sc, ang * 180.0 / 3.141592653589793);
-            }
-        });
-    }
-
-    // Add an override on THIS class only. If it already owns the selector we
-    // replace its own IMP; otherwise class_addMethod overrides the inherited
-    // UIView setter on the subclass WITHOUT touching UIView globally.
-    if (!class_addMethod(cls, sel, repl, enc)) {
-        method_setImplementation(class_getInstanceMethod(cls, sel), repl);
-    }
-    NSLog(@"[26Anim] skew: hooked %s (%s)", class_getName(cls), is3D ? "3D" : "2D");
+    IMP repl = imp_implementationWithBlock(^void(id s, SEL c, double fraction) {
+        typedef void (*Tick)(id, SEL, double);
+        Tick o = (Tick)orig;
+        o(s, c, fraction);
+        applySkewToAnimator(s, fraction);
+    });
+    method_setImplementation(m, repl);
+    NSLog(@"[26Anim] skew: hooked %s %s", clsName, selName);
 }
 
 static void swizzleSkew(void) {
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    SEL sel = sel_registerName("setTransform:");
-    int hooked = 0;
-    if (classes) {
-        for (unsigned int i = 0; i < count; i++) {
-            const char *name = class_getName(classes[i]);
-            if (!zoomNameMatch(name)) continue;
-            @try {
-                addSkewToClass(classes[i], sel);
-                hooked++;
-            } @catch (...) { /* ignore one bad class */ }
-        }
-        free(classes);
-    }
-    NSLog(@"[26Anim] skew: hooked %d zoom/snapshot classes", hooked);
+    // _applyZoomFraction: is the SBScaleIconZoomAnimator per-frame tick.
+    // _setAnimationFraction: is the SBIconZoomAnimator base per-frame tick.
+    swizzleZoomTick("SBScaleIconZoomAnimator", "_applyZoomFraction:");
+    swizzleZoomTick("SBScaleIconZoomAnimator", "_setAnimationFraction:");
+    swizzleZoomTick("SBIconZoomAnimator", "_setAnimationFraction:");
+    // Folder/library zoom variants share the same base tick; hook their own too.
+    swizzleZoomTick("SBFolderIconZoomAnimator", "_setAnimationFraction:");
+    swizzleZoomTick("SBLibraryZoomAnimator", "_setAnimationFraction:");
 }
 
 %ctor {
