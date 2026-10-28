@@ -46,6 +46,7 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <CoreFoundation/CoreFoundation.h>
 
 // ---------- tunables ----------
@@ -137,110 +138,210 @@ static void swizzleDoubleSetter(const char *clsName, const char *selName,
     NSLog(@"[26Anim] swizzled %s %s -> force %.3f", clsName, selName, val);
 }
 
-// ---------- iOS 26 perspective-tilt (app open/close), v1.0.7 ----------
-// EMPIRICAL FINDINGS from the iOS 15.8.8 runtime class index (128103 classes):
-//   * SBZoomView / SBFullscreenZoomView do NOT implement -setTransform: and have no
-//     scale property at all (only init/contentView/statusBar). That is exactly why
-//     v1.0.4 (SBFullscreenZoomView setTransform:) and v1.0.6 (name-scanned Zoom views)
-//     produced NO visible tilt: the hook could install, but the animation never
-//     calls those methods -- the animator drives the frame from outside.
-//   * The real driver is SBIconZoomAnimator (SpringBoardHome) and its subclass
-//     SBScaleIconZoomAnimator, which implements:
-//        - (void)_setAnimationFraction:(double)fraction   // base class, every frame
-//        - (void)_applyZoomFraction:(double)fraction      // SBScale*, every frame
-//        - (void)_setZoomScale:(double)scale
-//        - (void)_applyVisualAltitudeFraction:(double)f
-//     `fraction` runs 0..1 while the icon zooms up into the app (and 1..0 on close).
+// ---------- iOS 26 perspective-tilt (app open/close), v1.0.8 ----------
+// WHY v1.0.7 STILL HAD NO EFFECT (two real reasons):
+//   (1) The zoom is driven by Core Animation. The ObjC ticks
+//       -_setAnimationFraction: / -_applyZoomFraction: are NOT called every frame;
+//       interpolation happens in the render server. So a per-frame ObjC hook can
+//       never paint a per-frame tilt.
+//   (2) v1.0.7 assigned layer.transform = <rotation only>, which THREW AWAY the
+//       system's own scale (a UIView's scale lives in layer.transform).
 //
-// v1.0.7 DESIGN (no crash surface at all):
-//   Hook ONLY the animator, never layers, never global UIKit, never the heuristic
-//   name scan. On each fraction tick we take the animator's *own* target icon view
-//   (targetIconView / referenceIconView) and apply a perspective+rotateY to that
-//   one view's layer -- the single view we know is on screen for THIS animation.
-//   Everything is wrapped in @try and null-checked; all arguments are plain double,
-//   so there is no ABI-signature hazard. If the classes/methods are absent we log
-//   and do nothing (safe no-op).
+// v1.0.8 DESIGN (works with Core Animation instead of against it):
+//   * Trigger on SBIconAnimator -prepare, which runs ONCE before the zoom.
+//   * Add a PARALLEL CAAnimation with keyPath "transform.rotation.y" going from
+//     skewAngle -> 0. That keyPath is an AUXILIARY transform component, so it
+//     stacks on top of the system's own scale animation rather than replacing it.
+//     Core Animation interpolates it every frame by itself -> no ObjC ticks needed.
+//   * Perspective comes from superlayer.sublayerTransform.m34, restored on -cleanup.
+//   * Diagnostics are written to a FILE you can open with Filza (no terminal!):
+//       /var/mobile/Library/Preferences/26anim_diag.txt
+//     It records which classes/methods exist, which hooks installed, whether
+//     prepare/cleanup fire, which view was found, and how often each tick runs.
 static BOOL gSkewFiredLogged = NO;
 
-// Find a UIView on the animator to tilt: SBScaleIconZoomAnimator exposes
-// -targetIconView and -referenceIconView (both UIView*). We try those via
-// respondsToSelector/NSSelectorFromString so nothing is hard-linked.
-static UIView *skewTargetView(id animator) {
+// ---------------- diagnostics (file-based, Filza-readable) ----------------
+static NSString * const k26Diag = @"/var/mobile/Library/Preferences/26anim_diag.txt";
+static NSMutableArray      *gDiagLines = nil;
+static NSMutableDictionary *gTickCounts = nil;
+
+static void DiagInit(void) {
+    if (!gDiagLines)   gDiagLines   = [NSMutableArray array];
+    if (!gTickCounts)  gTickCounts  = [NSMutableDictionary dictionary];
+}
+static void DiagFlush(void) {
     @try {
-        SEL sels[3] = {
-            NSSelectorFromString(@"targetIconView"),
-            NSSelectorFromString(@"referenceIconView"),
-            NSSelectorFromString(@"targetIconContainerView")
-        };
-        for (int i = 0; i < 3; i++) {
-            if (![animator respondsToSelector:sels[i]]) continue;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            id v = [animator performSelector:sels[i]];
-#pragma clang diagnostic pop
-            if (v && [v isKindOfClass:[UIView class]]) return (UIView *)v;
+        DiagInit();
+        NSMutableString *s = [NSMutableString string];
+        [s appendString:@"== 26AnimSafe diagnostics ==\n"];
+        for (NSString *l in gDiagLines) [s appendFormat:@"%@\n", l];
+        [s appendString:@"\n-- tick counts (n>0 means it really runs) --\n"];
+        for (NSString *k in gTickCounts) {
+            NSDictionary *e = gTickCounts[k];
+            [s appendFormat:@"%@ n=%@ first=%@ last=%@\n", k, e[@"n"], e[@"first"], e[@"last"]];
         }
+        [s writeToFile:k26Diag atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } @catch (...) { }
+}
+static void Diag(NSString *line) {
+    @try {
+        DiagInit();
+        if ([gDiagLines count] < 400) [gDiagLines addObject:line];
+        DiagFlush();
+    } @catch (...) { }
+}
+static void DiagTick(NSString *key, double frac) {
+    @try {
+        DiagInit();
+        NSMutableDictionary *e = gTickCounts[key];
+        if (!e) { e = [NSMutableDictionary dictionary]; e[@"n"] = @0; e[@"first"] = @(frac); gTickCounts[key] = e; }
+        int n = [e[@"n"] intValue] + 1;
+        e[@"n"] = @(n);
+        e[@"last"] = @(frac);
+        if (n <= 3 || n % 20 == 0) DiagFlush();
+    } @catch (...) { }
+}
+
+// ---------------- find the view to tilt ----------------
+static id Msg(id o, const char *name) {
+    if (!o) return nil;
+    SEL s = sel_registerName(name);
+    if (![o respondsToSelector:s]) return nil;
+    @try { return ((id (*)(id, SEL))objc_msgSend)(o, s); } @catch (...) { return nil; }
+}
+
+static UIView *skewTargetView(id animator) {
+    // ordered: prefer a single icon view, fall back to the container
+    const char *names[] = { "targetIconView", "referenceIconView",
+                            "targetIconContainerView", "referenceView",
+                            "animationContainer" };
+    for (int i = 0; i < 5; i++) {
+        id v = Msg(animator, names[i]);
+        if (v && [v isKindOfClass:[UIView class]]) {
+            Diag([NSString stringWithFormat:@"view via %s -> %@", names[i], NSStringFromClass([v class])]);
+            return (UIView *)v;
+        }
+    }
     return nil;
 }
 
-// fraction 0..1 (0 = icon in grid, 1 = app fullscreen). Tilt peaks mid-flight.
-static void applySkewToAnimator(id animator, double fraction) {
-    if (!gSkewEnabled) return;
-    if (fraction <= 0.02 || fraction >= 0.985) return;   // only mid-flight
-    UIView *v = skewTargetView(animator);
-    if (v == nil) return;
+static double tiltDuration(id animator) {
     @try {
-        // Peak at ~30% progress, fade to 0 at both ends so the end state is flat.
-        double f = fraction;
-        double curve = (f < 0.3) ? (f / 0.3) : ((1.0 - f) / 0.7);
-        if (curve <= 0.0) return;
-        double ang = gSkewAngle * curve * (3.141592653589793 / 180.0);
-        CATransform3D p = CATransform3DIdentity;
-        p.m34 = -1.0f / 350.0f;                  // perspective
-        CATransform3D r = CATransform3DRotate(p, ang, 0.0f, 1.0f, 0.0f);
-        v.layer.transform = r;                   // write the LAYER, not the view setter
+        id st = Msg(animator, "settings");
+        if (st) {
+            SEL ds = sel_registerName("duration");
+            if ([st respondsToSelector:ds]) {
+                double d = ((double (*)(id, SEL))objc_msgSend)(st, ds);
+                if (d > 0.05 && d < 3.0) return d;
+            }
+        }
+    } @catch (...) { }
+    return 0.45;
+}
+
+// ---------------- the tilt itself ----------------
+static void addTilt(UIView *v, double dur) {
+    @try {
+        if (!v) return;
+        CALayer *parent = v.layer.superlayer;
+        if (parent) {
+            CATransform3D persp = CATransform3DIdentity;
+            persp.m34 = -1.0f / 500.0f;
+            parent.sublayerTransform = persp;
+        }
+        CABasicAnimation *rot = [CABasicAnimation animationWithKeyPath:@"transform.rotation.y"];
+        rot.fromValue = [NSNumber numberWithDouble:gSkewAngle * (3.141592653589793 / 180.0)];
+        rot.toValue   = [NSNumber numberWithDouble:0.0];
+        rot.duration  = dur;
+        rot.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        rot.removedOnCompletion = YES;
+        [v.layer addAnimation:rot forKey:@"26anim_tilt"];
         if (!gSkewFiredLogged) {
             gSkewFiredLogged = YES;
-            NSLog(@"[26Anim] skew: FIRED on %@ fraction=%.3f angle=%.2f",
-                  NSStringFromClass([v class]), fraction, ang * 180.0 / 3.141592653589793);
+            Diag([NSString stringWithFormat:@"TILT ADDED view=%@ dur=%.3f angle=%.1f",
+                  NSStringFromClass([v class]), dur, gSkewAngle]);
         }
+    } @catch (...) { Diag(@"addTilt threw"); }
+}
+
+static void removeTilt(UIView *v) {
+    @try {
+        if (!v) return;
+        [v.layer removeAnimationForKey:@"26anim_tilt"];
+        CALayer *parent = v.layer.superlayer;
+        if (parent) parent.sublayerTransform = CATransform3DIdentity;
     } @catch (...) { }
 }
 
-// Hook a -(void)xxx:(double) method on clsName that ticks the zoom animation.
-static void swizzleZoomTick(const char *clsName, const char *selName) {
+// ---------------- hooks ----------------
+// -(void)xxx  no arguments -> zero ABI risk
+static void hookVoid(const char *clsName, const char *selName, BOOL isPrepare) {
     Class cls = objc_getClass(clsName);
-    if (cls == Nil) { NSLog(@"[26Anim] skew: %s absent, skip", clsName); return; }
+    if (!cls) { Diag([NSString stringWithFormat:@"class %s absent", clsName]); return; }
     SEL sel = sel_registerName(selName);
     Method m = class_getInstanceMethod(cls, sel);
-    if (m == NULL) { NSLog(@"[26Anim] skew: %s %s absent, skip", clsName, selName); return; }
+    if (!m) { Diag([NSString stringWithFormat:@"%s %s absent", clsName, selName]); return; }
+    IMP orig = method_getImplementation(m);
+    IMP repl;
+    if (isPrepare) {
+        repl = imp_implementationWithBlock(^void(id s, SEL c) {
+            ((void (*)(id, SEL))orig)(s, c);
+            @try {
+                Diag([NSString stringWithFormat:@"PREPARE on %@", NSStringFromClass([s class])]);
+                if (!gSkewEnabled) { Diag(@"prepare: skew disabled"); return; }
+                UIView *v = skewTargetView(s);
+                if (!v) { Diag(@"prepare: NO VIEW FOUND"); return; }
+                addTilt(v, tiltDuration(s));
+            } @catch (...) { Diag(@"prepare threw"); }
+        });
+    } else {
+        repl = imp_implementationWithBlock(^void(id s, SEL c) {
+            ((void (*)(id, SEL))orig)(s, c);
+            @try {
+                Diag([NSString stringWithFormat:@"CLEANUP on %@", NSStringFromClass([s class])]);
+                if (!gSkewEnabled) return;
+                removeTilt(skewTargetView(s));
+            } @catch (...) { }
+        });
+    }
+    method_setImplementation(m, repl);
+    Diag([NSString stringWithFormat:@"hooked %s %s", clsName, selName]);
+}
+
+// -(void)xxx:(double)  diagnostics only (how often does it really fire?)
+static void hookTick(const char *clsName, const char *selName) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) { Diag([NSString stringWithFormat:@"tick class %s absent", clsName]); return; }
+    SEL sel = sel_registerName(selName);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { Diag([NSString stringWithFormat:@"tick %s %s absent", clsName, selName]); return; }
     const char *enc = method_getTypeEncoding(m);
-    if (enc == NULL || strstr(enc, "d") == NULL) {
-        // Signature is not (double) -- refuse rather than risk an ABI mismatch.
-        NSLog(@"[26Anim] skew: %s %s enc=%s unexpected, skip", clsName, selName, enc ? enc : "(null)");
+    if (!enc || !strstr(enc, ":8d")) {   // refuse anything that is not a plain double arg
+        Diag([NSString stringWithFormat:@"tick %s %s enc=%s skipped", clsName, selName, enc?enc:"(null)"]);
         return;
     }
     IMP orig = method_getImplementation(m);
-    IMP repl = imp_implementationWithBlock(^void(id s, SEL c, double fraction) {
-        typedef void (*Tick)(id, SEL, double);
-        Tick o = (Tick)orig;
-        o(s, c, fraction);
-        applySkewToAnimator(s, fraction);
+    IMP repl = imp_implementationWithBlock(^void(id s, SEL c, double f) {
+        ((void (*)(id, SEL, double))orig)(s, c, f);
+        DiagTick([NSString stringWithFormat:@"%s.%s", clsName, selName], f);
     });
     method_setImplementation(m, repl);
-    NSLog(@"[26Anim] skew: hooked %s %s", clsName, selName);
+    Diag([NSString stringWithFormat:@"hooked tick %s %s", clsName, selName]);
 }
 
 static void swizzleSkew(void) {
-    // _applyZoomFraction: is the SBScaleIconZoomAnimator per-frame tick.
-    // _setAnimationFraction: is the SBIconZoomAnimator base per-frame tick.
-    swizzleZoomTick("SBScaleIconZoomAnimator", "_applyZoomFraction:");
-    swizzleZoomTick("SBScaleIconZoomAnimator", "_setAnimationFraction:");
-    swizzleZoomTick("SBIconZoomAnimator", "_setAnimationFraction:");
-    // Folder/library zoom variants share the same base tick; hook their own too.
-    swizzleZoomTick("SBFolderIconZoomAnimator", "_setAnimationFraction:");
-    swizzleZoomTick("SBLibraryZoomAnimator", "_setAnimationFraction:");
+    DiagInit();
+    Diag([NSString stringWithFormat:@"ctor start skewEnabled=%d angle=%.1f", gSkewEnabled, gSkewAngle]);
+    // Hook the BASE class once: subclasses (SBScaleIconZoomAnimator,
+    // SBCenterIconZoomAnimator, ...) inherit it, so we cover the whole family
+    // without double-swizzling the same Method (which would recurse).
+    hookVoid("SBIconAnimator", "prepare", YES);
+    hookVoid("SBIconAnimator", "cleanup", NO);
+    // per-frame ticks: diagnostics only, to prove whether they run at all
+    hookTick("SBScaleIconZoomAnimator", "_applyZoomFraction:");
+    hookTick("SBScaleIconZoomAnimator", "_setAnimationFraction:");
+    hookTick("SBIconZoomAnimator", "_setAnimationFraction:");
+    DiagFlush();
 }
 
 %ctor {
