@@ -20,27 +20,37 @@
 			<key>defaults</key>
 			<string>com.you.26animsafe</string>
 			<key>key</key>
-			<string>skewEnabled</string>
+			<string>enabled</string>
 			<key>label</key>
-			<string>iOS 26 打开/关闭 斜面</string>
+			<string>iOS 26 慢速动画</string>
 		</dict>
 		<dict>
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>慢速缩放 (额外, 默认关)</string>
+			<string>高级</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>iOS 26 的「斜面/透视倾斜」依赖私有网格曲面变形，iOS 15 无法复现，相关实验代码已在 1.1.0 全部移除。本版保留的是已验证有效的部分：把应用打开/关闭的弹簧放慢（response 0.45）且无回弹（dampingRatio 1.0）。</string>
+			<key>label</key>
+			<string>说明</string>
 		</dict>
 		<dict>
 			<key>PostNotification</key>
 			<string>com.you.26animsafe/settingschanged</string>
 			<key>cell</key>
-			<string>PSSegmentCell</string>
+			<string>PSSwitchCell</string>
 			<key>default</key>
-			<integer>0</integer>
+			<false/>
 			<key>defaults</key>
 			<string>com.you.26animsafe</string>
 			<key>key</key>
-			<string>enabled</string>
+			<string>useNativeSpeed</string>
+			<key>label</key>
+			<string>原生速度 (关闭则回原生)</string>
 			<key>validTitles</key>
 			<array>
 				<string>原生缩放 (stock)</string>
